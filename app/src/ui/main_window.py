@@ -43,6 +43,14 @@ class MainWindow(QMainWindow):
         self.viewer = qtViewer3d(self)
         self.viewer.InitDriver()
 
+        # -----------------------------
+        # Global Coordinate System (Trihedron)
+        # -----------------------------
+        try:
+            self.viewer._display.View_Trihedron(True)
+        except Exception:
+            pass
+
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.tree)
         splitter.addWidget(self.viewer)
