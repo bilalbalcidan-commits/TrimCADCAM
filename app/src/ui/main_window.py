@@ -22,6 +22,10 @@ from core.document import Document
 from core.step_io import load_step, build_edge_index
 from core.selection import EdgePicker
 
+# ✅ FAZ 3 – ADIM 4B: geometry ordering imports
+from geometry.edge_ordering import order_edges
+from geometry.edge_endpoints import edge_endpoints
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -70,6 +74,11 @@ class MainWindow(QMainWindow):
         self.act_cancel_poly = QAction("Cancel Selection", self)
         self.act_cancel_poly.triggered.connect(self.cancel_polyline_selection)
         tb.addAction(self.act_cancel_poly)
+
+        # ✅ FAZ 3 – ADIM 4B: Order Selected Polyline action
+        self.act_order_poly = QAction("Order Selected Polyline", self)
+        self.act_order_poly.triggered.connect(self.on_order_selected_polyline)
+        tb.addAction(self.act_order_poly)
 
         # ---- Selection State ----
         self._selected_edge_ids: list[int] = []
@@ -212,3 +221,49 @@ class MainWindow(QMainWindow):
 
         self.build_tree()
         self.statusBar().showMessage(f"{name} created.")
+
+    # ---------------- FAZ 3: Order Polyline ----------------
+    def on_order_selected_polyline(self) -> None:
+        """
+        Orders the currently selected polyline from the tree and stores it in Document.
+        Minimal UI plumbing: logs a short report to console and status bar.
+        """
+        # 1) Get selected polyline name from the tree
+        item = self.tree.currentItem()
+        if item is None:
+            print("[OrderPolyline] Select a polyline node in the tree (e.g., Polyline_001).")
+            return
+
+        polyline_name = item.text(0)
+        if polyline_name not in self.doc.polylines:
+            print("[OrderPolyline] Select a polyline node in the tree (e.g., Polyline_001).")
+            return
+
+        edge_ids = self.doc.polylines.get(polyline_name, [])
+        if not edge_ids:
+            print(f"[OrderPolyline] Polyline '{polyline_name}' has no edges.")
+            return
+
+        # 2) Build endpoints callback: edge_id -> (P0, P1)
+        def get_endpoints_by_id(eid: int):
+            try:
+                edge = self.doc.edges[eid]
+            except Exception as ex:
+                raise IndexError(f"Invalid edge id {eid}: {ex}") from ex
+            return edge_endpoints(edge)
+
+        # 3) Run ordering
+        ordered = order_edges(edge_ids, get_endpoints=get_endpoints_by_id, tol_mm=0.05)
+
+        # 4) Store result in Document
+        self.doc.set_ordered_polyline(polyline_name, ordered)
+
+        # 5) Minimal feedback
+        r = ordered.report
+        msg = (
+            f"[OrderPolyline] {polyline_name}: "
+            f"edges={len(ordered.edge_ids)} closed={r.is_closed} "
+            f"gaps={len(r.gaps)} branch={r.branches_detected} disconnected={r.disconnected_islands}"
+        )
+        print(msg)
+        self.statusBar().showMessage(msg, 8000)
