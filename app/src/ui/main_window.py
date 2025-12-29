@@ -15,10 +15,11 @@ from PySide6.QtWidgets import (
 )
 
 from OCC.Display.backend import load_backend
+
 load_backend("pyside6")
 from OCC.Display.qtDisplay import qtViewer3d
 
-# ✅ DOĞRU TRI HEDRON IMPORTLARI
+# ✅ AIS Trihedron (works in all pythonocc setups)
 from OCC.Core.gp import gp_Pnt, gp_Dir, gp_Ax2
 from OCC.Core.Geom import Geom_Axis2Placement
 from OCC.Core.AIS import AIS_Trihedron
@@ -47,26 +48,6 @@ class MainWindow(QMainWindow):
 
         self.viewer = qtViewer3d(self)
         self.viewer.InitDriver()
-
-        # -------------------------------------------------
-        # Global Coordinate System (AIS_Trihedron) - FINAL
-        # -------------------------------------------------
-        try:
-            ax2 = gp_Ax2(
-                gp_Pnt(0.0, 0.0, 0.0),      # Origin
-                gp_Dir(0.0, 0.0, 1.0),      # Z axis
-                gp_Dir(1.0, 0.0, 0.0),      # X axis
-            )
-
-            geom_ax2 = Geom_Axis2Placement(ax2)
-            self._trihedron = AIS_Trihedron(geom_ax2)
-            self._trihedron.SetSize(80.0)  # mm
-
-            ctx = self.viewer._display.Context
-            ctx.Display(self._trihedron, False)
-        except Exception as e:
-            self._trihedron = None
-            print("AIS_Trihedron init failed:", e)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.tree)
@@ -115,12 +96,80 @@ class MainWindow(QMainWindow):
         self.viewer._display.View_Iso()
         self.viewer._display.FitAll()
 
+        # -------------------------------------------------
+        # Global Coordinate System (AIS_Trihedron)
+        # - Works everywhere
+        # - We keep it visible after STEP import (EraseAll)
+        # - We auto-adjust size so it stays readable on zoom
+        # -------------------------------------------------
+        self._trihedron = self._create_trihedron()
+        self._display_trihedron()
+
+        # Zoom-friendly: keep trihedron readable (approx. zoom-independent feel)
+        self._tri_update = QTimer(self)
+        self._tri_update.setInterval(200)  # ms
+        self._tri_update.timeout.connect(self._update_trihedron_size)
+        self._tri_update.start()
+
         # Poll timer
         self._pick_poll = QTimer(self)
         self._pick_poll.setInterval(40)
         self._pick_poll.timeout.connect(self._consume_last_pick)
 
         self.build_tree()
+
+    # ---------------- Trihedron helpers ----------------
+    def _create_trihedron(self) -> AIS_Trihedron | None:
+        try:
+            ax2 = gp_Ax2(
+                gp_Pnt(0.0, 0.0, 0.0),  # Origin
+                gp_Dir(0.0, 0.0, 1.0),  # Z
+                gp_Dir(1.0, 0.0, 0.0),  # X
+            )
+            geom_ax2 = Geom_Axis2Placement(ax2)
+            tri = AIS_Trihedron(geom_ax2)
+            tri.SetSize(80.0)  # baseline
+            return tri
+        except Exception as e:
+            print("AIS_Trihedron create failed:", e)
+            return None
+
+    def _display_trihedron(self) -> None:
+        """Display trihedron in context (safe to call multiple times)."""
+        if self._trihedron is None:
+            return
+        try:
+            ctx = self.viewer._display.Context
+            ctx.Display(self._trihedron, False)
+        except Exception as e:
+            print("AIS_Trihedron display failed:", e)
+
+    def _update_trihedron_size(self) -> None:
+        """
+        Keep trihedron readable while zooming.
+        This is an approximation (screen-constant feel) that works without overlay APIs.
+        """
+        if self._trihedron is None:
+            return
+        try:
+            view = self.viewer._display.View
+            s = float(view.Scale())  # typically increases with zoom-in
+
+            # Tune: bigger = more stable visual size.
+            # Clamp to avoid extreme sizes.
+            size = 80.0 / max(0.0001, s)
+            size = max(30.0, min(140.0, size))
+
+            self._trihedron.SetSize(size)
+
+            # Optional: request redraw
+            try:
+                view.Redraw()
+            except Exception:
+                pass
+        except Exception:
+            # Keep silent; size update is best-effort
+            pass
 
     # ---------------- Tree ----------------
     def build_tree(self) -> None:
@@ -161,17 +210,12 @@ class MainWindow(QMainWindow):
             self.doc.set_model(file_path, shape, edges)
             self.picker.set_edges(self.doc.edges)
 
-            # IMPORTANT: EraseAll clears EVERYTHING (including trihedron).
+            # EraseAll clears displayed AIS objects (including trihedron)
             self.viewer._display.EraseAll()
             self.viewer._display.DisplayShape(shape, update=True)
 
-            # ✅ Re-display trihedron after EraseAll so it never disappears
-            try:
-                if getattr(self, "_trihedron", None) is not None:
-                    ctx = self.viewer._display.Context
-                    ctx.Display(self._trihedron, False)
-            except Exception as e:
-                print("AIS_Trihedron re-display failed:", e)
+            # ✅ Re-display trihedron after EraseAll
+            self._display_trihedron()
 
             self.viewer._display.FitAll()
 
