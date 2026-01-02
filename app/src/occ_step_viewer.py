@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QToolBar,
     QSplashScreen,
 )
-from PySide6.QtGui import QAction, QPixmap, QColor
+from PySide6.QtGui import QAction, QPixmap, QColor, QShortcut, QKeySequence
 
 from OCC.Display.backend import load_backend
 load_backend("pyside6")
@@ -366,6 +366,18 @@ class MainWindow(QMainWindow):
         self._selected_ais = {}
         self._selected_color = (0.0, 1.0, 0.0)
 
+        # View mode: 0=SHADED_CLEAN, 1=WIREFRAME
+        self._view_mode = 0
+        self._view_shortcut = QShortcut(QKeySequence("H"), self)
+        self._view_shortcut.setAutoRepeat(False)
+        self._view_shortcut.activated.connect(self._toggle_view_mode)
+
+        # HLR debounce timer
+        self._hlr_timer = QTimer(self)
+        self._hlr_timer.setSingleShot(True)
+        self._hlr_timer.setInterval(120)
+        self._hlr_timer.timeout.connect(self._rebuild_hlr_overlay)
+
         # Displayed objects (hide/show)
         self._model_ais = None
         self._polyline_ais = {}  # name -> AIS_Shape
@@ -467,7 +479,8 @@ class MainWindow(QMainWindow):
             # Create controller
             self._view_toolbar_ctrl = ViewToolbarController(
                 parent_widget,
-                lambda: self.viewer._display.View
+                lambda: self.viewer._display.View,
+                self._schedule_hlr_rebuild,
             )
 
             # Force visibility and top stacking
@@ -895,6 +908,13 @@ class MainWindow(QMainWindow):
                     mods = QApplication.keyboardModifiers()
                     self._last_click_shift = bool(mods & Qt.ShiftModifier)
                     QTimer.singleShot(0, self._capture_detected_edge_after_click)
+                self._schedule_hlr_rebuild()
+
+            if event.type() == QEvent.MouseButtonRelease and event.button() != Qt.LeftButton:
+                self._schedule_hlr_rebuild()
+
+            if event.type() == QEvent.Wheel:
+                self._schedule_hlr_rebuild()
 
         # ✅ DO NOT swallow event
         return super().eventFilter(obj, event)
@@ -1083,17 +1103,32 @@ class MainWindow(QMainWindow):
 
         file_name_norm = Path(file_path).name.strip().casefold()
         for idx, part in enumerate(parts):
+            # Defensive: part may be a tuple like (key, dict)
+            if isinstance(part, tuple):
+                if len(part) >= 2 and isinstance(part[1], dict):
+                    part = part[1]
+                elif len(part) >= 1 and isinstance(part[0], dict):
+                    part = part[0]
             name = part.get("name") or f"Part_{idx + 1:03d}"
             name_norm = str(name).strip().casefold()
             if name_norm == file_name_norm:
                 continue
             pnode = QTreeWidgetItem(shapes, [name])
+            shape = part.get("shape")
             ais = self._assembly_ais.get(name)
             ais_edges = self._assembly_edges_ais.get(name)
             pnode.setData(
                 0,
                 Qt.UserRole,
-                {"kind": "STEP_PART", "key": name, "id": idx, "ais": ais, "ais_edges": ais_edges},
+                {
+                    "kind": "STEP_PART",
+                    "key": name,
+                    "id": idx,
+                    "shape": shape,
+                    "ais": ais,
+                    "ais_edges": ais_edges,
+                    "ais_hlr": None,
+                },
             )
             pnode.setFlags(pnode.flags() | Qt.ItemIsUserCheckable)
             pnode.setCheckState(0, Qt.Checked)
@@ -1152,6 +1187,19 @@ class MainWindow(QMainWindow):
                             ctx.Display(ais, False)
                         else:
                             ctx.Remove(ais, False)
+                    for it in self._iter_tree_items(item):
+                        payload = None
+                        try:
+                            payload = it.data(0, Qt.UserRole)
+                        except Exception:
+                            payload = None
+                        if isinstance(payload, dict):
+                            ais_hlr = payload.get("ais_hlr")
+                            if ais_hlr is not None:
+                                if visible and int(getattr(self, "_view_mode", 0)) == 0:
+                                    ctx.Display(ais_hlr, False)
+                                else:
+                                    ctx.Remove(ais_hlr, False)
                     ctx.UpdateCurrentViewer()
             except Exception:
                 pass
@@ -1168,6 +1216,13 @@ class MainWindow(QMainWindow):
         if kind == "STEP_PART" and isinstance(key, str):
             ais = self._assembly_ais.get(key)
             ais_edges = self._assembly_edges_ais.get(key)
+            ais_hlr = None
+            try:
+                payload = item.data(0, Qt.UserRole)
+                if isinstance(payload, dict):
+                    ais_hlr = payload.get("ais_hlr")
+            except Exception:
+                pass
             try:
                 ctx = self._get_ctx()
                 if ctx is not None:
@@ -1181,6 +1236,11 @@ class MainWindow(QMainWindow):
                             ctx.Display(ais_edges, False)
                         else:
                             ctx.Remove(ais_edges, False)
+                    if ais_hlr is not None:
+                        if visible and int(getattr(self, "_view_mode", 0)) == 0:
+                            ctx.Display(ais_hlr, False)
+                        else:
+                            ctx.Remove(ais_hlr, False)
                     ctx.UpdateCurrentViewer()
             except Exception:
                 pass
@@ -1307,6 +1367,7 @@ class MainWindow(QMainWindow):
         if isinstance(payload, dict):
             ais = payload.get("ais")
             ais_edges = payload.get("ais_edges")
+            ais_hlr = payload.get("ais_hlr")
             try:
                 ctx = self._get_ctx()
                 if ctx is not None:
@@ -1318,6 +1379,11 @@ class MainWindow(QMainWindow):
                     if ais_edges is not None:
                         try:
                             ctx.Remove(ais_edges, False)
+                        except Exception:
+                            pass
+                    if ais_hlr is not None:
+                        try:
+                            ctx.Remove(ais_hlr, False)
                         except Exception:
                             pass
                     try:
@@ -1638,10 +1704,247 @@ class MainWindow(QMainWindow):
             else:
                 self._assembly_parts = []
                 self.set_tree_for_step(file_path, edge_count)
+            self._apply_view_mode()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open STEP:\n{e}")
 
+
+    def _iter_tree_items(self, root):
+        for i in range(root.childCount()):
+            ch = root.child(i)
+            yield ch
+            yield from self._iter_tree_items(ch)
+
+    def _build_hlr_edges_for_shape(self, shape, view):
+        from OCC.Core.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
+        from OCC.Core.HLRAlgo import HLRAlgo_Projector
+        from OCC.Core.gp import gp_Ax2, gp_Pnt, gp_Dir
+        from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeCompound
+
+        cam = None
+        try:
+            cam = view.Camera()
+        except Exception:
+            cam = None
+
+        try:
+            d = cam.Direction() if cam is not None else gp_Dir(0, 0, -1)
+        except Exception:
+            d = gp_Dir(0, 0, -1)
+        try:
+            xdir = cam.XDirection() if cam is not None else gp_Dir(1, 0, 0)
+        except Exception:
+            xdir = gp_Dir(1, 0, 0)
+
+        ax2 = gp_Ax2(gp_Pnt(0, 0, 0), d, xdir)
+        proj = HLRAlgo_Projector(ax2)
+
+        algo = HLRBRep_Algo()
+        algo.Add(shape)
+        algo.Projector(proj)
+        algo.Update()
+        algo.Hide()
+
+        hlr = HLRBRep_HLRToShape(algo)
+        comp_mk = BRepBuilderAPI_MakeCompound()
+
+        try:
+            ve = hlr.VCompound()
+            if not ve.IsNull():
+                comp_mk.Add(ve)
+        except Exception:
+            pass
+
+        try:
+            outl = hlr.OutLineVCompound()
+            if not outl.IsNull():
+                comp_mk.Add(outl)
+        except Exception:
+            pass
+
+        return comp_mk.Compound()
+
+    def _ensure_part_hlr_overlay(self, item):
+        payload = item.data(0, Qt.UserRole)
+        if not isinstance(payload, dict):
+            return
+        shape = payload.get("shape")
+        if shape is None:
+            return
+
+        ctx = self._get_ctx()
+        view = self._get_occ_view()
+        if ctx is None or view is None:
+            return
+
+        edge_shape = self._build_hlr_edges_for_shape(shape, view)
+        if edge_shape is None:
+            return
+
+        ais_hlr = payload.get("ais_hlr")
+        if ais_hlr is not None:
+            try:
+                ctx.Remove(ais_hlr, False)
+            except Exception:
+                pass
+
+        ais_hlr = AIS_Shape(edge_shape)
+        payload["ais_hlr"] = ais_hlr
+        item.setData(0, Qt.UserRole, payload)
+
+        try:
+            ctx.SetDisplayMode(ais_hlr, 0, False)
+        except Exception:
+            pass
+
+        edge_col = Quantity_Color(0.30, 0.30, 0.30, Quantity_TOC_RGB)
+        try:
+            ctx.SetColor(ais_hlr, edge_col, False)
+        except Exception:
+            try:
+                ais_hlr.SetColor(edge_col)
+            except Exception:
+                pass
+
+        try:
+            ais_hlr.SetWidth(1.0)
+        except Exception:
+            pass
+
+        if int(getattr(self, "_view_mode", 0)) == 0:
+            try:
+                ctx.Display(ais_hlr, False)
+            except Exception:
+                pass
+
+    def _toggle_view_mode(self):
+        self._view_mode = 1 - int(getattr(self, "_view_mode", 0))
+        try:
+            msg = "View mode : shaded" if self._view_mode == 0 else "View mode : wireframe"
+            self.statusBar().showMessage(msg, 3000)
+        except Exception:
+            pass
+        self._apply_view_mode()
+
+    def _apply_view_mode(self):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        if self._model_ais is not None:
+            try:
+                ctx.Display(self._model_ais, False)
+                ctx.SetDisplayMode(self._model_ais, 1 if self._view_mode == 0 else 0, False)
+            except Exception:
+                pass
+
+        top = self.tree.invisibleRootItem()
+        for it in self._iter_tree_items(top):
+            payload = it.data(0, Qt.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            if "ais" not in payload:
+                continue
+
+            ais = payload.get("ais")
+            ais_edges = payload.get("ais_edges")
+            ais_hlr = payload.get("ais_hlr")
+
+            if self._view_mode == 0:
+                if ais is not None:
+                    try:
+                        ctx.Display(ais, False)
+                        ctx.SetDisplayMode(ais, 1, False)
+                    except Exception:
+                        pass
+                if ais_edges is not None:
+                    try:
+                        ctx.Erase(ais_edges, False)
+                    except Exception:
+                        pass
+                if ais_hlr is not None:
+                    try:
+                        ctx.Display(ais_hlr, False)
+                    except Exception:
+                        pass
+                else:
+                    self._schedule_hlr_rebuild()
+            else:
+                if ais_hlr is not None:
+                    try:
+                        ctx.Erase(ais_hlr, False)
+                    except Exception:
+                        pass
+                if ais_edges is not None:
+                    try:
+                        ctx.Display(ais_edges, False)
+                    except Exception:
+                        pass
+                    if ais is not None:
+                        try:
+                            ctx.Erase(ais, False)
+                        except Exception:
+                            pass
+                elif ais is not None:
+                    try:
+                        ctx.Display(ais, False)
+                        ctx.SetDisplayMode(ais, 0, False)
+                    except Exception:
+                        pass
+
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
+    def _schedule_hlr_rebuild(self):
+        if int(getattr(self, "_view_mode", 0)) != 0:
+            return
+        try:
+            self._hlr_timer.start()
+        except Exception:
+            pass
+
+    def _rebuild_hlr_overlay(self):
+        if int(getattr(self, "_view_mode", 0)) != 0:
+            return
+
+        ctx = self._get_ctx()
+        view = self._get_occ_view()
+        if ctx is None or view is None:
+            return
+
+        top = self.tree.invisibleRootItem()
+        for it in self._iter_tree_items(top):
+            payload = it.data(0, Qt.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            if not payload.get("shape") or not payload.get("ais"):
+                continue
+
+            ais = payload.get("ais")
+            ais_hlr = payload.get("ais_hlr")
+
+            try:
+                is_disp = ctx.IsDisplayed(ais)
+            except Exception:
+                is_disp = True
+
+            if not is_disp:
+                if ais_hlr is not None:
+                    try:
+                        ctx.Erase(ais_hlr, False)
+                    except Exception:
+                        pass
+                continue
+
+            self._ensure_part_hlr_overlay(it)
+
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
 
 def main():
     app = QApplication(sys.argv)
