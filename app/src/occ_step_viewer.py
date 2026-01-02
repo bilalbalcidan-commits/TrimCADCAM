@@ -11,8 +11,9 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QSplitter,
     QToolBar,
+    QSplashScreen,
 )
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QPixmap
 
 from OCC.Display.backend import load_backend
 load_backend("pyside6")
@@ -843,7 +844,21 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     w = MainWindow()
-    w.showMaximized()
+    splash = None
+    splash_path = Path(__file__).resolve().parents[2] / "assets" / "splash.png"
+    if splash_path.is_file():
+        pixmap = QPixmap(str(splash_path))
+        if not pixmap.isNull():
+            splash = QSplashScreen(pixmap)
+            splash.show()
+            app.processEvents()
+    if splash is None:
+        w.showMaximized()
+    else:
+        def _show_main():
+            splash.finish(w)
+            w.showMaximized()
+        QTimer.singleShot(5000, _show_main)
     sys.exit(app.exec())
 
 
