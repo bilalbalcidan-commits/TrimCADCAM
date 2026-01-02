@@ -495,17 +495,7 @@ class MainWindow(QMainWindow):
             # Hover: keep detection updated (this is what your working code did)
             if event.type() == QEvent.MouseMove:
                 if self._selection_mode and self._current_shape is not None:
-                    ctx = self._get_ctx()
-                    view = self._get_occ_view()
-                    if ctx is not None and view is not None:
-                        xy = self._qt_to_occ_xy(event)
-                        if xy is not None:
-                            x, y = xy
-                            try:
-                                # True: stabilize detected update (your working approach)
-                                ctx.MoveTo(x, y, view, True)
-                            except Exception:
-                                pass
+                    self._hover_move_to_debounced(event, 120)
 
             # Click release: defer capture by 0ms so OCC finishes its internal update
             if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
@@ -518,6 +508,35 @@ class MainWindow(QMainWindow):
 
         # ✅ DO NOT swallow event
         return super().eventFilter(obj, event)
+
+    def _hover_move_to_debounced(self, event, debounce_ms: int = 30):
+        self._pending_move_event = event
+        if not hasattr(self, "_hover_timer") or self._hover_timer is None:
+            self._hover_timer = QTimer(self)
+            self._hover_timer.setSingleShot(True)
+            self._hover_timer.timeout.connect(self._process_hover_move)
+        self._hover_timer.stop()
+        self._hover_timer.start(debounce_ms)
+
+    def _process_hover_move(self):
+        if not self._selection_mode or self._current_shape is None:
+            return
+        ctx = self._get_ctx()
+        view = self._get_occ_view()
+        if ctx is None or view is None:
+            return
+        event = getattr(self, "_pending_move_event", None)
+        if event is None:
+            return
+        xy = self._qt_to_occ_xy(event)
+        if xy is None:
+            return
+        x, y = xy
+        try:
+            ctx.MoveTo(x, y, view, True)
+        except Exception:
+            pass
+
 
     def _capture_detected_object_after_click(self):
         ctx = self._get_ctx()
@@ -731,6 +750,9 @@ class MainWindow(QMainWindow):
                 "Polyline selection: Hover highlights edge; Click selects (deferred). SHIFT+Click removes. Then OK."
             )
         else:
+            if hasattr(self, "_hover_timer") and self._hover_timer is not None:
+                self._hover_timer.stop()
+            self._pending_move_event = None
             self._selected_edge_ids = []
             self._clear_selected_overlay()
             self.statusBar().showMessage("Selection mode off.")
