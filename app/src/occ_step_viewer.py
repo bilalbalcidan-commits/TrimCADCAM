@@ -97,6 +97,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.viewer)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 4)
+        splitter.setSizes([280, 1120])
         self.setCentralWidget(splitter)
 
         # Menu
