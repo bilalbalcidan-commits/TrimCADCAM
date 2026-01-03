@@ -481,7 +481,6 @@ class MainWindow(QMainWindow):
             self._view_toolbar_ctrl = ViewToolbarController(
                 parent_widget,
                 lambda: self.viewer._display.View,
-                self._schedule_hlr_rebuild,
             )
 
             # Force visibility and top stacking
@@ -780,14 +779,6 @@ class MainWindow(QMainWindow):
                     ctx.Remove(ais, False)
                 except Exception:
                     pass
-        for _, ais in list(self._assembly_edges_ais.items()):
-            try:
-                ctx.Remove(ais, True)
-            except Exception:
-                try:
-                    ctx.Remove(ais, False)
-                except Exception:
-                    pass
         self._assembly_ais.clear()
         self._assembly_edges_ais.clear()
         try:
@@ -968,13 +959,6 @@ class MainWindow(QMainWindow):
                     mods = QApplication.keyboardModifiers()
                     self._last_click_shift = bool(mods & Qt.ShiftModifier)
                     QTimer.singleShot(0, self._capture_detected_edge_after_click)
-                self._schedule_hlr_rebuild()
-
-            if event.type() == QEvent.MouseButtonRelease and event.button() != Qt.LeftButton:
-                self._schedule_hlr_rebuild()
-
-            if event.type() == QEvent.Wheel:
-                self._schedule_hlr_rebuild()
 
         # ✅ DO NOT swallow event
         return super().eventFilter(obj, event)
@@ -1176,7 +1160,6 @@ class MainWindow(QMainWindow):
             pnode = QTreeWidgetItem(shapes, [name])
             shape = part.get("shape")
             ais = self._assembly_ais.get(name)
-            ais_edges = self._assembly_edges_ais.get(name)
             pnode.setData(
                 0,
                 Qt.UserRole,
@@ -1186,7 +1169,7 @@ class MainWindow(QMainWindow):
                     "id": idx,
                     "shape": shape,
                     "ais": ais,
-                    "ais_edges": ais_edges,
+                    "ais_edges": None,
                     "ais_hlr": None,
                 },
             )
@@ -1226,43 +1209,15 @@ class MainWindow(QMainWindow):
             kind, key = data
         visible = (item.checkState(0) == Qt.Checked)
 
-        if kind in ("ROOT", "GROUP_SHAPES"):
+        if item.childCount() > 0 and kind != "STEP_PART":
             self._tree_updating_checks = True
             try:
                 for i in range(item.childCount()):
                     child = item.child(i)
-                    child.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
+                    if child is not None:
+                        child.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
             finally:
                 self._tree_updating_checks = False
-            try:
-                ctx = self._get_ctx()
-                if ctx is not None:
-                    for _, ais in self._assembly_ais.items():
-                        if visible:
-                            ctx.Display(ais, False)
-                        else:
-                            ctx.Remove(ais, False)
-                    for _, ais in self._assembly_edges_ais.items():
-                        if visible:
-                            ctx.Display(ais, False)
-                        else:
-                            ctx.Remove(ais, False)
-                    for it in self._iter_tree_items(item):
-                        payload = None
-                        try:
-                            payload = it.data(0, Qt.UserRole)
-                        except Exception:
-                            payload = None
-                        if isinstance(payload, dict):
-                            ais_hlr = payload.get("ais_hlr")
-                            if ais_hlr is not None:
-                                if visible and int(getattr(self, "_view_mode", 0)) == 0:
-                                    ctx.Display(ais_hlr, False)
-                                else:
-                                    ctx.Remove(ais_hlr, False)
-                    ctx.UpdateCurrentViewer()
-            except Exception:
-                pass
             return
 
         if kind == "STEP_MODEL" and key == "MODEL":
@@ -1273,41 +1228,26 @@ class MainWindow(QMainWindow):
             ais = self._polyline_ais.get(key)
             self._set_ais_visible(ais, visible)
             return
+
         if kind == "STEP_PART" and isinstance(key, str):
             ais = self._assembly_ais.get(key)
-            ais_edges = self._assembly_edges_ais.get(key)
-            ais_hlr = None
+            ctx = self._get_ctx()
+            if ctx is None:
+                return
             try:
-                payload = item.data(0, Qt.UserRole)
-                if isinstance(payload, dict):
-                    ais_hlr = payload.get("ais_hlr")
-            except Exception:
-                pass
-            try:
-                ctx = self._get_ctx()
-                if ctx is not None:
+                if visible:
                     if ais is not None:
-                        if visible:
-                            ctx.Display(ais, False)
-                        else:
-                            ctx.Remove(ais, False)
-                    if ais_edges is not None:
-                        if visible:
-                            ctx.Display(ais_edges, False)
-                        else:
-                            ctx.Remove(ais_edges, False)
-                    if ais_hlr is not None:
-                        if visible and int(getattr(self, "_view_mode", 0)) == 0:
-                            ctx.Display(ais_hlr, False)
-                        else:
-                            ctx.Remove(ais_hlr, False)
-                    ctx.UpdateCurrentViewer()
+                        ctx.Display(ais, False)
+                        mode = 1 if int(getattr(self, "_view_mode", 0)) == 0 else 0
+                        ctx.SetDisplayMode(ais, mode, False)
+                        if mode == 1:
+                            self._apply_catia_shaded_style(ais)
+                else:
+                    if ais is not None:
+                        ctx.Remove(ais, False)
+                ctx.UpdateCurrentViewer()
             except Exception:
                 pass
-            return
-
-        if kind == "GROUP_SHAPES":
-            self._set_ais_visible(self._model_ais, visible)
             return
 
         if kind == "GROUP_POLYLINES":
@@ -1426,24 +1366,12 @@ class MainWindow(QMainWindow):
             payload = None
         if isinstance(payload, dict):
             ais = payload.get("ais")
-            ais_edges = payload.get("ais_edges")
-            ais_hlr = payload.get("ais_hlr")
             try:
                 ctx = self._get_ctx()
                 if ctx is not None:
                     if ais is not None:
                         try:
                             ctx.Remove(ais, False)
-                        except Exception:
-                            pass
-                    if ais_edges is not None:
-                        try:
-                            ctx.Remove(ais_edges, False)
-                        except Exception:
-                            pass
-                    if ais_hlr is not None:
-                        try:
-                            ctx.Remove(ais_hlr, False)
                         except Exception:
                             pass
                     try:
@@ -1746,7 +1674,6 @@ class MainWindow(QMainWindow):
                         ctx.SetColor(ais_edges, edge_col, False)
                         ais_edges.SetTransparency(1.0)
                         ctx.Display(ais_shaded, False)
-                        ctx.Display(ais_edges, False)
                         self._apply_catia_shaded_style(ais_shaded)
                         self._assembly_ais[part["name"]] = ais_shaded
                         self._assembly_edges_ais[part["name"]] = ais_edges
@@ -1846,12 +1773,6 @@ class MainWindow(QMainWindow):
             return
 
         ais_hlr = payload.get("ais_hlr")
-        if ais_hlr is not None:
-            try:
-                ctx.Remove(ais_hlr, False)
-            except Exception:
-                pass
-
         ais_hlr = AIS_Shape(edge_shape)
         payload["ais_hlr"] = ais_hlr
         item.setData(0, Qt.UserRole, payload)
@@ -1875,11 +1796,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        if int(getattr(self, "_view_mode", 0)) == 0:
-            try:
-                ctx.Display(ais_hlr, False)
-            except Exception:
-                pass
+        return
 
     def _toggle_view_mode(self):
         self._view_mode = 1 - int(getattr(self, "_view_mode", 0))
@@ -1888,7 +1805,40 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(msg, 3000)
         except Exception:
             pass
-        self._apply_view_mode()
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        mode = 1 if self._view_mode == 0 else 0
+        if self._model_ais is not None:
+            try:
+                ctx.SetDisplayMode(self._model_ais, mode, False)
+                if mode == 1:
+                    self._apply_catia_shaded_style(self._model_ais)
+            except Exception:
+                pass
+        top = self.tree.invisibleRootItem()
+        for it in self._iter_tree_items(top):
+            payload = it.data(0, Qt.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("kind") != "STEP_PART":
+                continue
+            if it.checkState(0) != Qt.Checked:
+                continue
+            key = payload.get("key") or payload.get("name") or it.text(0)
+            ais = payload.get("ais") or self._assembly_ais.get(key)
+            if ais is None:
+                continue
+            try:
+                ctx.SetDisplayMode(ais, mode, False)
+                if mode == 1:
+                    self._apply_catia_shaded_style(ais)
+            except Exception:
+                pass
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
 
     def _apply_view_mode(self):
         ctx = self._get_ctx()
@@ -1907,54 +1857,20 @@ class MainWindow(QMainWindow):
             payload = it.data(0, Qt.UserRole)
             if not isinstance(payload, dict):
                 continue
-            if "ais" not in payload:
+            if payload.get("kind") != "STEP_PART":
                 continue
-
+            if it.checkState(0) != Qt.Checked:
+                continue
             ais = payload.get("ais")
-            ais_edges = payload.get("ais_edges")
-            ais_hlr = payload.get("ais_hlr")
-
-            if self._view_mode == 0:
-                if ais is not None:
-                    try:
-                        ctx.Display(ais, False)
-                        ctx.SetDisplayMode(ais, 1, False)
-                    except Exception:
-                        pass
-                if ais_edges is not None:
-                    try:
-                        ctx.Erase(ais_edges, False)
-                    except Exception:
-                        pass
-                if ais_hlr is not None:
-                    try:
-                        ctx.Display(ais_hlr, False)
-                    except Exception:
-                        pass
-                else:
-                    self._schedule_hlr_rebuild()
-            else:
-                if ais_hlr is not None:
-                    try:
-                        ctx.Erase(ais_hlr, False)
-                    except Exception:
-                        pass
-                if ais_edges is not None:
-                    try:
-                        ctx.Display(ais_edges, False)
-                    except Exception:
-                        pass
-                    if ais is not None:
-                        try:
-                            ctx.Erase(ais, False)
-                        except Exception:
-                            pass
-                elif ais is not None:
-                    try:
-                        ctx.Display(ais, False)
-                        ctx.SetDisplayMode(ais, 0, False)
-                    except Exception:
-                        pass
+            if ais is None:
+                continue
+            try:
+                ctx.Display(ais, False)
+                ctx.SetDisplayMode(ais, 1 if self._view_mode == 0 else 0, False)
+                if self._view_mode == 0:
+                    self._apply_catia_shaded_style(ais)
+            except Exception:
+                pass
 
         try:
             ctx.UpdateCurrentViewer()
@@ -1962,52 +1878,10 @@ class MainWindow(QMainWindow):
             pass
 
     def _schedule_hlr_rebuild(self):
-        if int(getattr(self, "_view_mode", 0)) != 0:
-            return
-        try:
-            self._hlr_timer.start()
-        except Exception:
-            pass
+        return
 
     def _rebuild_hlr_overlay(self):
-        if int(getattr(self, "_view_mode", 0)) != 0:
-            return
-
-        ctx = self._get_ctx()
-        view = self._get_occ_view()
-        if ctx is None or view is None:
-            return
-
-        top = self.tree.invisibleRootItem()
-        for it in self._iter_tree_items(top):
-            payload = it.data(0, Qt.UserRole)
-            if not isinstance(payload, dict):
-                continue
-            if not payload.get("shape") or not payload.get("ais"):
-                continue
-
-            ais = payload.get("ais")
-            ais_hlr = payload.get("ais_hlr")
-
-            try:
-                is_disp = ctx.IsDisplayed(ais)
-            except Exception:
-                is_disp = True
-
-            if not is_disp:
-                if ais_hlr is not None:
-                    try:
-                        ctx.Erase(ais_hlr, False)
-                    except Exception:
-                        pass
-                continue
-
-            self._ensure_part_hlr_overlay(it)
-
-        try:
-            ctx.UpdateCurrentViewer()
-        except Exception:
-            pass
+        return
 
 def main():
     app = QApplication(sys.argv)
