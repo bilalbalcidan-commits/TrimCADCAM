@@ -31,6 +31,7 @@ from OCC.Core.TopoDS import topods
 
 from OCC.Core.AIS import AIS_Shape
 from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
+from OCC.Core.Prs3d import Prs3d_Drawer
 
 from OCC.Core.BRep import BRep_Builder
 from OCC.Core.TopoDS import TopoDS_Compound
@@ -521,6 +522,64 @@ class MainWindow(QMainWindow):
             return None
         return getattr(disp, "Context", None)
 
+    def _apply_catia_shaded_style(self, ais_obj):
+        if ais_obj is None:
+            return
+
+        try:
+            if hasattr(ais_obj, "HasOwnAttributes"):
+                if not ais_obj.HasOwnAttributes():
+                    try:
+                        ais_obj.SetAttributes(Prs3d_Drawer())
+                    except Exception:
+                        try:
+                            ais_obj.SetOwnDrawer(Prs3d_Drawer())
+                        except Exception:
+                            pass
+            elif hasattr(ais_obj, "HasOwnDrawer"):
+                if not ais_obj.HasOwnDrawer():
+                    try:
+                        ais_obj.SetOwnDrawer(Prs3d_Drawer())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        try:
+            drawer = ais_obj.Attributes()
+        except Exception:
+            drawer = None
+
+        if drawer is None:
+            return
+
+        try:
+            drawer.SetFaceBoundaryDraw(True)
+        except Exception:
+            pass
+
+        try:
+            edge_col = Quantity_Color(0.15, 0.15, 0.15, Quantity_TOC_RGB)
+            try:
+                drawer.SetFaceBoundaryAspect(edge_col, 1.0, True)
+            except Exception:
+                try:
+                    from OCC.Core.Prs3d import Prs3d_LineAspect
+                    line_aspect = Prs3d_LineAspect(edge_col, Aspect_TOL_SOLID, 1.0)
+                    drawer.SetFaceBoundaryAspect(line_aspect)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if int(getattr(self, "_view_mode", 0)) == 0:
+            ctx = self._get_ctx()
+            if ctx is not None:
+                try:
+                    ctx.SetDisplayMode(ais_obj, 1, False)
+                except Exception:
+                    pass
+
     def _force_edge_selection_mode(self):
         d = getattr(self.viewer, "_display", None)
         if d is None:
@@ -704,6 +763,7 @@ class MainWindow(QMainWindow):
 
         ais = AIS_Shape(shape)
         ctx.Display(ais, True)
+        self._apply_catia_shaded_style(ais)
         self._model_ais = ais
 
     def _clear_assembly_display(self):
@@ -1461,6 +1521,7 @@ class MainWindow(QMainWindow):
                 ctx.SetColor(ais, qcol, True)
             except Exception:
                 ctx.SetColor(ais, qcol, False)
+            self._apply_catia_shaded_style(ais)
             try:
                 ctx.Redisplay(ais, True)
             except Exception:
@@ -1484,6 +1545,7 @@ class MainWindow(QMainWindow):
 
         try:
             ais.SetColor(qcol)
+            self._apply_catia_shaded_style(ais)
             try:
                 self.viewer._display.Context.UpdateCurrentViewer()
             except Exception:
@@ -1685,6 +1747,7 @@ class MainWindow(QMainWindow):
                         ais_edges.SetTransparency(1.0)
                         ctx.Display(ais_shaded, False)
                         ctx.Display(ais_edges, False)
+                        self._apply_catia_shaded_style(ais_shaded)
                         self._assembly_ais[part["name"]] = ais_shaded
                         self._assembly_edges_ais[part["name"]] = ais_edges
                     try:
