@@ -22,7 +22,7 @@ from OCC.Display.backend import load_backend
 load_backend("pyside6")
 from OCC.Display.qtDisplay import qtViewer3d
 
-from OCC.Core.STEPControl import STEPControl_Reader
+from OCC.Core.STEPControl import STEPControl_Reader, STEPControl_Writer, STEPControl_AsIs
 from OCC.Core.IFSelect import IFSelect_RetDone
 
 from OCC.Core.TopExp import TopExp_Explorer
@@ -353,6 +353,7 @@ class MainWindow(QMainWindow):
         # ---- DATA ----
         self._current_shape = None
         self._current_step_path: str | None = None
+        self._is_dirty = False
 
         self._edge_list = []
         self._selection_mode = False
@@ -446,6 +447,18 @@ class MainWindow(QMainWindow):
         open_action = QAction("Open STEP...", self)
         open_action.triggered.connect(self.open_step_dialog)
         file_menu.addAction(open_action)
+        save_asm_action = QAction("Save Assembly", self)
+        save_asm_action.triggered.connect(self.on_save_assembly)
+        file_menu.addAction(save_asm_action)
+        save_all_action = QAction("Save All Parts", self)
+        save_all_action.triggered.connect(self.on_save_all_parts)
+        file_menu.addAction(save_all_action)
+        close_model_action = QAction("Close Part/Assembly", self)
+        close_model_action.triggered.connect(self.on_close_model)
+        file_menu.addAction(close_model_action)
+        close_program_action = QAction("Close Program", self)
+        close_program_action.triggered.connect(self.on_close_program)
+        file_menu.addAction(close_program_action)
 
         # Toolbar
         tb = QToolBar("Tools")
@@ -744,6 +757,26 @@ class MainWindow(QMainWindow):
                     ctx.Erase(ais_obj, True)
             except Exception:
                 pass
+
+    def _set_part_visible(self, payload: dict, visible: bool):
+        if not isinstance(payload, dict):
+            return
+        ais = payload.get("ais")
+        if ais is None:
+            return
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        try:
+            if visible:
+                ctx.Display(ais, False)
+            else:
+                ctx.Remove(ais, False)
+        except Exception:
+            pass
+
+    def _mark_dirty(self):
+        self._is_dirty = True
 
     def _display_model(self, shape):
         ctx = self._get_ctx()
@@ -1138,12 +1171,12 @@ class MainWindow(QMainWindow):
         root = QTreeWidgetItem(self.tree, ["Assembly"])
         root.setFlags(root.flags() | Qt.ItemIsUserCheckable)
         root.setCheckState(0, Qt.Checked)
-        root.setData(0, Qt.UserRole, ("ROOT", None))
+        root.setData(0, Qt.UserRole, {"type": "assembly"})
 
         shapes = QTreeWidgetItem(root, [Path(file_path).name])
         shapes.setFlags(shapes.flags() | Qt.ItemIsUserCheckable)
         shapes.setCheckState(0, Qt.Checked)
-        shapes.setData(0, Qt.UserRole, ("GROUP_SHAPES", None))
+        shapes.setData(0, Qt.UserRole, {"type": "group"})
 
         file_name_norm = Path(file_path).name.strip().casefold()
         for idx, part in enumerate(parts):
@@ -1164,6 +1197,7 @@ class MainWindow(QMainWindow):
                 0,
                 Qt.UserRole,
                 {
+                    "type": "part",
                     "kind": "STEP_PART",
                     "key": name,
                     "id": idx,
@@ -1195,6 +1229,35 @@ class MainWindow(QMainWindow):
         self.tree.expandAll()
         self.tree.blockSignals(False)
 
+    def _propagate_group_check_and_visibility(self, item: QTreeWidgetItem, visible: bool):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        check_state = Qt.Checked if visible else Qt.Unchecked
+        self._tree_updating_checks = True
+        try:
+            stack = [item]
+            while stack:
+                parent = stack.pop()
+                for i in range(parent.childCount()):
+                    child = parent.child(i)
+                    if child is None:
+                        continue
+                    if child.flags() & Qt.ItemIsUserCheckable:
+                        child.setCheckState(0, check_state)
+                    stack.append(child)
+                    payload = child.data(0, Qt.UserRole)
+                    if isinstance(payload, dict):
+                        ptype = payload.get("type")
+                        if ptype == "part" or payload.get("kind") == "STEP_PART":
+                            self._set_part_visible(payload, visible)
+        finally:
+            self._tree_updating_checks = False
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
     def on_tree_item_changed(self, item: QTreeWidgetItem, column: int):
         if self._tree_updating_checks:
             return
@@ -1202,12 +1265,37 @@ class MainWindow(QMainWindow):
         if not data:
             return
 
+        payload = data if isinstance(data, dict) else None
         if isinstance(data, dict):
+            payload_type = data.get("type")
             kind = data.get("kind")
             key = data.get("key")
         else:
+            payload_type = None
             kind, key = data
         visible = (item.checkState(0) == Qt.Checked)
+        if item.flags() & Qt.ItemIsUserCheckable:
+            self._mark_dirty()
+        if payload_type in ("group", "assembly"):
+            self._propagate_group_check_and_visibility(item, visible)
+            return
+
+        if isinstance(payload, dict) and (payload.get("ais") is not None or self._model_ais is not None):
+            ctx = self._get_ctx()
+            if ctx is None:
+                return
+            try:
+                ais = (payload.get("ais") if isinstance(payload, dict) else None) or self._model_ais
+                if ais is None:
+                    return
+                if visible:
+                    ctx.Display(ais, False)
+                else:
+                    ctx.Remove(ais, False)
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
+            return
 
         if item.childCount() > 0 and kind != "STEP_PART":
             self._tree_updating_checks = True
@@ -1227,27 +1315,6 @@ class MainWindow(QMainWindow):
         if kind == "POLYLINE" and isinstance(key, str):
             ais = self._polyline_ais.get(key)
             self._set_ais_visible(ais, visible)
-            return
-
-        if kind == "STEP_PART" and isinstance(key, str):
-            ais = self._assembly_ais.get(key)
-            ctx = self._get_ctx()
-            if ctx is None:
-                return
-            try:
-                if visible:
-                    if ais is not None:
-                        ctx.Display(ais, False)
-                        mode = 1 if int(getattr(self, "_view_mode", 0)) == 0 else 0
-                        ctx.SetDisplayMode(ais, mode, False)
-                        if mode == 1:
-                            self._apply_catia_shaded_style(ais)
-                else:
-                    if ais is not None:
-                        ctx.Remove(ais, False)
-                ctx.UpdateCurrentViewer()
-            except Exception:
-                pass
             return
 
         if kind == "GROUP_POLYLINES":
@@ -1607,6 +1674,188 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{name} created.")
 
     # ---------------- File open ----------------
+    def on_save_assembly(self):
+        if self._current_shape is None:
+            QMessageBox.information(self, "Save Assembly", "No assembly loaded.")
+            return False
+
+        default_path = str(Path.cwd() / "assembly.step")
+        if self._current_step_path:
+            try:
+                default_path = str(Path(self._current_step_path).with_suffix(".step"))
+            except Exception:
+                pass
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Assembly as STEP",
+            default_path,
+            "STEP Files (*.stp *.step);;All Files (*.*)",
+        )
+        if not file_path:
+            return False
+
+        writer = STEPControl_Writer()
+        status = writer.Transfer(self._current_shape, STEPControl_AsIs)
+        if status != IFSelect_RetDone:
+            QMessageBox.critical(self, "Save Assembly", "STEP transfer failed.")
+            return False
+        status = writer.Write(file_path)
+        if status != IFSelect_RetDone:
+            QMessageBox.critical(self, "Save Assembly", "STEP write failed.")
+            return False
+        try:
+            self.statusBar().showMessage(f"Assembly saved: {Path(file_path).name}", 4000)
+        except Exception:
+            pass
+        self._is_dirty = False
+        return True
+
+    def on_save_all_parts(self):
+        if self._current_shape is None:
+            QMessageBox.information(self, "Save All Parts", "No assembly loaded.")
+            return
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder to Save Parts",
+            str(Path.cwd()),
+        )
+        if not folder:
+            return
+
+        parts = list(self._iter_leaf_parts())
+        if not parts:
+            QMessageBox.information(self, "Save All Parts", "No parts found to export.")
+            return
+
+        used_names = set()
+        ok_count = 0
+        fail_count = 0
+        for item, payload in parts:
+            shape = payload.get("shape")
+            if shape is None:
+                fail_count += 1
+                continue
+            base_name = self._sanitize_filename(item.text(0)) or ""
+            if not base_name:
+                base_name = f"Part_{ok_count + fail_count + 1:04d}"
+            name = base_name
+            suffix = 2
+            while name.casefold() in used_names:
+                name = f"{base_name}_{suffix:02d}"
+                suffix += 1
+            used_names.add(name.casefold())
+            file_path = str(Path(folder) / f"{name}.step")
+
+            writer = STEPControl_Writer()
+            status = writer.Transfer(shape, STEPControl_AsIs)
+            if status != IFSelect_RetDone:
+                fail_count += 1
+                continue
+            status = writer.Write(file_path)
+            if status != IFSelect_RetDone:
+                fail_count += 1
+                continue
+            ok_count += 1
+
+        QMessageBox.information(
+            self,
+            "Save All Parts",
+            f"Export complete.\nSucceeded: {ok_count}\nFailed: {fail_count}",
+        )
+        try:
+            self.statusBar().showMessage(
+                f"Save All Parts: {ok_count} ok, {fail_count} failed.",
+                4000,
+            )
+        except Exception:
+            pass
+
+    def _maybe_save_changes(self) -> bool:
+        if not self._is_dirty:
+            return True
+        choice = QMessageBox.question(
+            self,
+            "Unsaved Changes",
+            "Save changes before closing?",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+        )
+        if choice == QMessageBox.Yes:
+            return self.on_save_assembly()
+        if choice == QMessageBox.No:
+            return True
+        return False
+
+    def _close_current_model(self):
+        self.clear_all_selections()
+        self._clear_selected_overlay()
+        self._clear_all_polylines_display()
+        self._clear_assembly_display()
+
+        ctx = self._get_ctx()
+        if ctx is not None and self._model_ais is not None:
+            try:
+                ctx.Remove(self._model_ais, False)
+            except Exception:
+                pass
+        self._model_ais = None
+
+        try:
+            self.viewer._display.EraseAll()
+        except Exception:
+            pass
+
+        self._current_shape = None
+        self._current_step_path = None
+        self._assembly_parts = []
+        self._edge_list = []
+        self._polylines.clear()
+        self._polyline_counter = 0
+        self._selected_edge_ids = []
+        self._is_dirty = False
+
+        self.build_empty_tree()
+        if ctx is not None:
+            try:
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
+
+    def on_close_model(self):
+        if self._current_shape is None:
+            QMessageBox.information(self, "Close Part/Assembly", "No model loaded.")
+            return
+        if not self._maybe_save_changes():
+            return
+        self._close_current_model()
+
+    def on_close_program(self):
+        self.close()
+
+    def _sanitize_filename(self, name: str) -> str:
+        if not isinstance(name, str):
+            return ""
+        bad = '\\/:*?"<>|'
+        cleaned = "".join(ch for ch in name if ch not in bad)
+        return cleaned.strip()
+
+    def _iter_leaf_parts(self):
+        top = self.tree.invisibleRootItem()
+        for it in self._iter_tree_items(top):
+            payload = it.data(0, Qt.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("ais") is None:
+                continue
+            yield it, payload
+
+    def closeEvent(self, event):
+        if self._maybe_save_changes():
+            event.accept()
+        else:
+            event.ignore()
+
     def open_step_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -1695,6 +1944,7 @@ class MainWindow(QMainWindow):
                 self._assembly_parts = []
                 self.set_tree_for_step(file_path, edge_count)
             self._apply_view_mode()
+            self._is_dirty = False
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open STEP:\n{e}")
