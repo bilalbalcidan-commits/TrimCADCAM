@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import re
 
 from PySide6.QtCore import Qt, QEvent, QTimer
 from PySide6.QtWidgets import (
@@ -10,13 +11,30 @@ from PySide6.QtWidgets import (
     QMenu,
     QInputDialog,
     QColorDialog,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QDockWidget,
+    QPlainTextEdit,
+    QLabel,
+    QPushButton,
+    QSpinBox,
+    QSlider,
     QTreeWidget,
     QTreeWidgetItem,
     QSplitter,
     QToolBar,
     QSplashScreen,
 )
-from PySide6.QtGui import QAction, QPixmap, QColor, QShortcut, QKeySequence
+from PySide6.QtGui import (
+    QAction,
+    QPixmap,
+    QColor,
+    QShortcut,
+    QKeySequence,
+    QTextCursor,
+    QTextCharFormat,
+)
 
 from OCC.Display.backend import load_backend
 load_backend("pyside6")
@@ -30,9 +48,10 @@ from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_SOLID
 from OCC.Core.TopoDS import topods
 
 from OCC.Core.AIS import AIS_Shape
-from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
+from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB, Quantity_NOC_YELLOW
 from OCC.Core.Prs3d import Prs3d_Drawer
 
+from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCC.Core.BRep import BRep_Builder
 from OCC.Core.TopoDS import TopoDS_Compound
 
@@ -48,7 +67,7 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QToolButton, QGraphicsDropShadowEffect
 from PySide6.QtSvg import QSvgRenderer
 
-from OCC.Core.gp import gp_Dir
+from OCC.Core.gp import gp_Dir, gp_Pnt
 
 
 def _svg_icon(svg: str, size: int = 20) -> QIcon:
@@ -357,6 +376,15 @@ class MainWindow(QMainWindow):
 
         self._edge_list = []
         self._selection_mode = False
+        self._toolpath_ais = None
+        self._toolpath_visible = True
+        self._nc_lines = []
+        self._nc_points = []
+        self._nc_line_to_point = []
+        self._nc_current_line = 0
+        self._nc_timer = QTimer(self)
+        self._nc_speed_ms = 200
+        self._nc_slider_updating = False
         self._selected_edge_ids = []
         self._polyline_counter = 0
         self._polylines = {}
@@ -441,12 +469,21 @@ class MainWindow(QMainWindow):
         splitter.setSizes([280, 1120])
         self.setCentralWidget(splitter)
 
+        self._build_nc_dock()
+        self._nc_timer.timeout.connect(self._nc_play_tick)
+
         # Menu
         menubar = self.menuBar()
         file_menu = menubar.addMenu("File")
         open_action = QAction("Open STEP...", self)
         open_action.triggered.connect(self.open_step_dialog)
         file_menu.addAction(open_action)
+        load_tp_action = QAction("Load NC Toolpath...", self)
+        load_tp_action.triggered.connect(self.open_nc_program_dialog)
+        file_menu.addAction(load_tp_action)
+        clear_tp_action = QAction("Clear Toolpath", self)
+        clear_tp_action.triggered.connect(self.clear_toolpath)
+        file_menu.addAction(clear_tp_action)
         save_asm_action = QAction("Save Assembly", self)
         save_asm_action.triggered.connect(self.on_save_assembly)
         file_menu.addAction(save_asm_action)
@@ -1945,6 +1982,7 @@ class MainWindow(QMainWindow):
                 self.set_tree_for_step(file_path, edge_count)
             self._apply_view_mode()
             self._is_dirty = False
+            print("[MODEL] FitAll")
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to open STEP:\n{e}")
@@ -2126,6 +2164,380 @@ class MainWindow(QMainWindow):
             ctx.UpdateCurrentViewer()
         except Exception:
             pass
+
+    # ---------------- NC program dock ----------------
+    def _build_nc_dock(self):
+        dock = QDockWidget("NC Program", self)
+        dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self._nc_status_label = QLabel("Line: 0/0  Points: 0/0")
+        layout.addWidget(self._nc_status_label)
+
+        controls = QHBoxLayout()
+        self._nc_btn_load = QPushButton("Load NC")
+        self._nc_btn_play = QPushButton("Play")
+        self._nc_btn_stop = QPushButton("Stop")
+        self._nc_btn_prev = QPushButton("Step -")
+        self._nc_btn_next = QPushButton("Step +")
+        controls.addWidget(self._nc_btn_load)
+        controls.addWidget(self._nc_btn_play)
+        controls.addWidget(self._nc_btn_stop)
+        controls.addWidget(self._nc_btn_prev)
+        controls.addWidget(self._nc_btn_next)
+
+        controls.addWidget(QLabel("Speed (ms):"))
+        self._nc_speed_spin = QSpinBox()
+        self._nc_speed_spin.setRange(20, 1000)
+        self._nc_speed_spin.setValue(self._nc_speed_ms)
+        controls.addWidget(self._nc_speed_spin)
+        layout.addLayout(controls)
+
+        self._nc_line_slider = QSlider(Qt.Horizontal)
+        self._nc_line_slider.setRange(0, 0)
+        layout.addWidget(self._nc_line_slider)
+
+        self._nc_view = QPlainTextEdit()
+        self._nc_view.setReadOnly(True)
+        layout.addWidget(self._nc_view, 1)
+
+        dock.setWidget(container)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock)
+        self._nc_dock = dock
+
+        self._nc_btn_load.clicked.connect(self.open_nc_program_dialog)
+        self._nc_btn_play.clicked.connect(self._nc_play_pause)
+        self._nc_btn_stop.clicked.connect(self._nc_stop)
+        self._nc_btn_prev.clicked.connect(self._nc_step_prev)
+        self._nc_btn_next.clicked.connect(self._nc_step_next)
+        self._nc_speed_spin.valueChanged.connect(self._nc_speed_changed)
+        self._nc_line_slider.valueChanged.connect(self._nc_slider_changed)
+
+    def load_nc_program(self, file_path: str):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            return
+
+        points = []
+        line_to_point = []
+        cur_x = 0.0
+        cur_y = 0.0
+        cur_z = 0.0
+        last_point_idx = -1
+        axis_re = re.compile(r"([XYZ])\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+
+        for line in lines:
+            matches = list(axis_re.finditer(line))
+            if matches:
+                next_x = cur_x
+                next_y = cur_y
+                next_z = cur_z
+                for m in matches:
+                    axis = m.group(1).upper()
+                    val = float(m.group(2))
+                    if axis == "X":
+                        next_x = val
+                    elif axis == "Y":
+                        next_y = val
+                    elif axis == "Z":
+                        next_z = val
+                if (next_x, next_y, next_z) != (cur_x, cur_y, cur_z):
+                    cur_x, cur_y, cur_z = next_x, next_y, next_z
+                    points.append((cur_x, cur_y, cur_z))
+                    last_point_idx = len(points) - 1
+            line_to_point.append(last_point_idx)
+
+        self._nc_lines = lines
+        self._nc_points = points
+        self._nc_line_to_point = line_to_point
+        self._nc_current_line = 0
+
+        self._nc_view.setPlainText("\n".join(self._nc_lines))
+        self._nc_line_slider.setRange(0, max(0, len(self._nc_lines) - 1))
+        self._nc_line_slider.setValue(0)
+        self.set_nc_line(0, fitall=True)
+        print(f"[NC] Loaded {len(points)} points from {Path(file_path).name}")
+        print(f"[NC] Program loaded: {Path(file_path).name} lines={len(lines)} points={len(points)}")
+
+    def set_nc_line(self, index: int, fitall: bool = False):
+        if not self._nc_lines:
+            self._nc_status_label.setText("Line: 0/0  Points: 0/0")
+            self.clear_toolpath()
+            return
+
+        idx = max(0, min(int(index), len(self._nc_lines) - 1))
+        self._nc_current_line = idx
+        if not self._nc_slider_updating:
+            self._nc_slider_updating = True
+            try:
+                self._nc_line_slider.setValue(idx)
+            finally:
+                self._nc_slider_updating = False
+
+        point_idx = self._nc_line_to_point[idx] if idx < len(self._nc_line_to_point) else -1
+        visible_count = point_idx + 1 if point_idx >= 0 else 0
+        total_points = len(self._nc_points)
+        self._nc_status_label.setText(
+            f"Line: {idx + 1}/{len(self._nc_lines)}  Points: {visible_count}/{total_points}"
+        )
+
+        if visible_count > 1:
+            self.load_toolpath_points(self._nc_points[:visible_count], fitall=fitall)
+        elif visible_count == 1:
+            self.load_toolpath_points(self._nc_points[:1], fitall=fitall)
+        else:
+            self.clear_toolpath()
+
+        self._highlight_nc_line(idx)
+        print(f"[NC] Line {idx + 1}/{len(self._nc_lines)} points={visible_count}/{total_points}")
+
+    def _highlight_nc_line(self, index: int):
+        if not self._nc_lines:
+            self._nc_view.setExtraSelections([])
+            return
+        try:
+            block = self._nc_view.document().findBlockByNumber(index)
+            if not block.isValid():
+                return
+            cursor = QTextCursor(block)
+            self._nc_view.setTextCursor(cursor)
+            self._nc_view.centerCursor()
+
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor(255, 235, 100, 128))
+            selection = QPlainTextEdit.ExtraSelection()
+            selection.cursor = cursor
+            selection.format = fmt
+            self._nc_view.setExtraSelections([selection])
+        except Exception:
+            pass
+
+    def _nc_play_pause(self):
+        if not self._nc_lines:
+            return
+        if self._nc_timer.isActive():
+            self._nc_timer.stop()
+            self._nc_btn_play.setText("Play")
+        else:
+            self._nc_timer.start(self._nc_speed_ms)
+            self._nc_btn_play.setText("Pause")
+
+    def _nc_stop(self):
+        self._nc_timer.stop()
+        self._nc_btn_play.setText("Play")
+        self.set_nc_line(0, fitall=False)
+
+    def _nc_step_next(self):
+        if not self._nc_lines:
+            return
+        self.set_nc_line(self._nc_current_line + 1, fitall=False)
+
+    def _nc_step_prev(self):
+        if not self._nc_lines:
+            return
+        self.set_nc_line(self._nc_current_line - 1, fitall=False)
+
+    def _nc_play_tick(self):
+        if not self._nc_lines:
+            self._nc_timer.stop()
+            return
+        if self._nc_current_line >= len(self._nc_lines) - 1:
+            self._nc_timer.stop()
+            self._nc_btn_play.setText("Play")
+            return
+        self.set_nc_line(self._nc_current_line + 1, fitall=False)
+
+    def _nc_speed_changed(self, value: int):
+        self._nc_speed_ms = int(value)
+        if self._nc_timer.isActive():
+            self._nc_timer.start(self._nc_speed_ms)
+
+    def _nc_slider_changed(self, value: int):
+        if self._nc_slider_updating:
+            return
+        self.set_nc_line(value, fitall=False)
+
+    # ---------------- NC toolpath display ----------------
+    def load_toolpath_points(self, points, fitall: bool = True):
+        if not points:
+            self.clear_toolpath()
+            return
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        self.clear_toolpath()
+
+        comp = TopoDS_Compound()
+        builder = BRep_Builder()
+        builder.MakeCompound(comp)
+
+        def _add_edge(p1, p2):
+            try:
+                edge = BRepBuilderAPI_MakeEdge(p1, p2).Edge()
+                builder.Add(comp, edge)
+            except Exception:
+                pass
+
+        is_segments = False
+        try:
+            first = points[0]
+            if len(first) == 2 and len(first[0]) >= 3 and len(first[1]) >= 3:
+                is_segments = True
+        except Exception:
+            is_segments = False
+
+        if is_segments:
+            for seg in points:
+                if not seg or len(seg) < 2:
+                    continue
+                try:
+                    p1 = gp_Pnt(float(seg[0][0]), float(seg[0][1]), float(seg[0][2]))
+                    p2 = gp_Pnt(float(seg[1][0]), float(seg[1][1]), float(seg[1][2]))
+                except Exception:
+                    continue
+                _add_edge(p1, p2)
+        else:
+            prev = None
+            for p in points:
+                if p is None or len(p) < 3:
+                    continue
+                try:
+                    pt = gp_Pnt(float(p[0]), float(p[1]), float(p[2]))
+                except Exception:
+                    continue
+                if prev is not None:
+                    _add_edge(prev, pt)
+                prev = pt
+
+        try:
+            ais = AIS_Shape(comp)
+            try:
+                ais.SetColor(Quantity_NOC_YELLOW)
+            except Exception:
+                pass
+            try:
+                ais.SetWidth(2.5)
+            except Exception:
+                pass
+            ctx.Display(ais, False)
+            try:
+                ctx.Deactivate(ais)
+            except Exception:
+                try:
+                    ctx.SetSelectable(ais, False)
+                except Exception:
+                    pass
+            self._toolpath_ais = ais
+            self._toolpath_visible = True
+            try:
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
+            if fitall:
+                try:
+                    self.viewer._display.FitAll()
+                    print("[MODEL] FitAll")
+                except Exception:
+                    pass
+        except Exception:
+            self._toolpath_ais = None
+
+    def load_toolpath(self, points):
+        self.load_toolpath_points(points, fitall=True)
+
+    def load_toolpath_from_file(self, file_path: str):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+        except Exception:
+            return
+
+        points = []
+        cur_x = 0.0
+        cur_y = 0.0
+        cur_z = 0.0
+        axis_re = re.compile(r"([XYZ])\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+
+        for line in lines:
+            matches = list(axis_re.finditer(line))
+            if not matches:
+                continue
+            next_x = cur_x
+            next_y = cur_y
+            next_z = cur_z
+            for m in matches:
+                axis = m.group(1).upper()
+                val = float(m.group(2))
+                if axis == "X":
+                    next_x = val
+                elif axis == "Y":
+                    next_y = val
+                elif axis == "Z":
+                    next_z = val
+            if (next_x, next_y, next_z) != (cur_x, cur_y, cur_z):
+                cur_x, cur_y, cur_z = next_x, next_y, next_z
+                points.append((cur_x, cur_y, cur_z))
+
+        self.load_toolpath_points(points, fitall=True)
+        print(f"[NC] Loaded {len(points)} points from {Path(file_path).name}")
+
+    def clear_toolpath(self):
+        ctx = self._get_ctx()
+        if ctx is None:
+            self._toolpath_ais = None
+            return
+        if self._toolpath_ais is not None:
+            try:
+                ctx.Remove(self._toolpath_ais, False)
+            except Exception:
+                pass
+            self._toolpath_ais = None
+            try:
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
+        print("[NC] Cleared")
+
+    def toggle_toolpath(self, enabled: bool):
+        self._toolpath_visible = bool(enabled)
+        ctx = self._get_ctx()
+        if ctx is None or self._toolpath_ais is None:
+            return
+        if self._toolpath_visible:
+            try:
+                ctx.Display(self._toolpath_ais, False)
+            except Exception:
+                pass
+            print("[NC] Toolpath ON")
+        else:
+            try:
+                ctx.Erase(self._toolpath_ais, False)
+            except Exception:
+                pass
+            print("[NC] Toolpath OFF")
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
+    def open_nc_program_dialog(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load NC Toolpath",
+            "",
+            "NC Files (*.anc *.nc *.tap *.txt);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        try:
+            self.load_nc_program(file_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load toolpath:\n{e}")
 
     def _schedule_hlr_rebuild(self):
         return
