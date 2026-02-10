@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 import re
 
-from PySide6.QtCore import Qt, QEvent, QTimer
+from PySide6.QtCore import Qt, QEvent, QTimer, QSettings
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -43,6 +43,10 @@ from PySide6.QtGui import (
     QTextCharFormat,
 )
 
+ROLE_AIS = Qt.UserRole
+ROLE_META = Qt.UserRole + 1
+ROLE_COLOR = Qt.UserRole + 2
+
 from OCC.Display.backend import load_backend
 load_backend("pyside6")
 from OCC.Display.qtDisplay import qtViewer3d
@@ -76,7 +80,7 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QToolButton, QGraphicsDropShadowEffect
 from PySide6.QtSvg import QSvgRenderer
 
-from OCC.Core.gp import gp_Dir, gp_Pnt, gp_Ax1, gp_Ax2, gp_Vec, gp_Trsf
+from OCC.Core.gp import gp_Dir, gp_Pnt, gp_Ax1, gp_Ax2, gp_Ax3, gp_Vec, gp_Trsf
 from OCC.Core.Geom import Geom_Axis2Placement
 import math
 
@@ -420,6 +424,7 @@ class MainWindow(QMainWindow):
         self._invert_vec_user_set = False
         self._invert_body_user_set = False
         self._tool_body_ais = None
+        self._tool_body_dims = None
         print("[VEC] Default convention set to C")
         self._mesh_quality = "Medium"
 
@@ -495,15 +500,53 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self.tree)
-        splitter.addWidget(self.viewer)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 4)
-        splitter.setSizes([280, 1120])
-        self.setCentralWidget(splitter)
+        try:
+            ctx = self.viewer._display.Context
+            hl = ctx.HighlightStyle()
+            hl.SetColor(Quantity_Color(1.0, 0.85, 0.2, Quantity_TOC_RGB))
+            hl.SetTransparency(0.6)
+            try:
+                hl.SetDisplayMode(1)  # keep shaded highlight (avoid wireframe/HLR)
+            except Exception:
+                pass
+            try:
+                ctx.SetHighlightStyle(hl)
+            except Exception:
+                pass
+            try:
+                drawer = ctx.DefaultDrawer()
+                drawer.SetDeviationCoefficient(0.001)
+                drawer.SetDeviationAngle(0.2)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
-        self._build_nc_dock()
+        left_splitter = QSplitter(Qt.Horizontal)
+        left_splitter.addWidget(self.tree)
+        left_splitter.addWidget(self.viewer)
+        left_splitter.setStretchFactor(0, 1)
+        left_splitter.setStretchFactor(1, 4)
+        left_splitter.setSizes([280, 1120])
+
+        self._code_panel = self._build_nc_panel()
+        self._main_splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter.addWidget(left_splitter)
+        self._main_splitter.addWidget(self._code_panel)
+        self._main_splitter.setStretchFactor(0, 4)
+        self._main_splitter.setStretchFactor(1, 1)
+        self.setCentralWidget(self._main_splitter)
+
+        self._settings = QSettings("TrimCADCAM", "MataTRIM")
+        sizes = self._settings.value("code_splitter_sizes", None)
+        if isinstance(sizes, list) and len(sizes) == 2:
+            try:
+                self._main_splitter.setSizes([int(sizes[0]), int(sizes[1])])
+            except Exception:
+                pass
+        else:
+            self._main_splitter.setSizes([1200, 300])
+        self._main_splitter.splitterMoved.connect(self._save_splitter_sizes)
         self._nc_timer.timeout.connect(self._nc_play_tick)
 
         # Menu
@@ -572,6 +615,10 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _, q=label: self._set_mesh_quality(q))
             mesh_group.addAction(act)
             mesh_menu.addAction(act)
+
+        toggle_code_action = QAction("Show/Hide Code Panel", self)
+        toggle_code_action.triggered.connect(self._toggle_code_panel)
+        view_menu.addAction(toggle_code_action)
 
         self.act_start_poly = QAction("Start Polyline Select", self)
         self.act_start_poly.setCheckable(True)
@@ -772,6 +819,74 @@ class MainWindow(QMainWindow):
         dy = h - dy
         return dx, dy
 
+    def _zoom_at_cursor(self, event) -> bool:
+        view = self._get_occ_view()
+        if view is None:
+            return False
+        xy = self._qt_to_occ_xy(event)
+        if xy is None:
+            return False
+        try:
+            delta = event.angleDelta().y()
+        except Exception:
+            delta = 0
+        if delta == 0:
+            return False
+        x, y = xy
+        factor = 0.9 if delta > 0 else 1.1
+        try:
+            if hasattr(view, "StartZoomAtPoint") and hasattr(view, "ZoomAtPoint"):
+                view.StartZoomAtPoint(x, y)
+                view.ZoomAtPoint(x, y, factor)
+            elif hasattr(view, "ZoomAtPoint"):
+                view.ZoomAtPoint(x, y, factor)
+            elif hasattr(view, "Zoom"):
+                step = 40
+                if delta > 0:
+                    view.Zoom(x - step, y - step, x + step, y + step)
+                else:
+                    view.Zoom(x + step, y + step, x - step, y - step)
+            else:
+                return False
+            try:
+                view.Redraw()
+            except Exception:
+                try:
+                    self.viewer._display.Repaint()
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            pass
+
+        try:
+            # Fallback: keep world point under cursor by pan correction.
+            before = view.Convert(x, y)
+            if hasattr(view, "Zoom"):
+                step = 40
+                if delta > 0:
+                    view.Zoom(x - step, y - step, x + step, y + step)
+                else:
+                    view.Zoom(x + step, y + step, x - step, y - step)
+            after = view.Convert(x, y)
+            try:
+                dx = before.X() - after.X()
+                dy = before.Y() - after.Y()
+                dz = before.Z() - after.Z()
+                view.Pan(dx, dy, dz)
+            except Exception:
+                pass
+            try:
+                view.Redraw()
+            except Exception:
+                try:
+                    self.viewer._display.Repaint()
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            return False
+
     # ---------------- ESC: clear all selections ----------------
     def clear_all_selections(self):
         self._selected_edge_ids = []
@@ -883,12 +998,20 @@ class MainWindow(QMainWindow):
         ctx = self._get_ctx()
         if ctx is None or ais_obj is None:
             return
+        self._set_ais_visible_no_update(ctx, ais_obj, visible)
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
+    def _set_ais_visible_no_update(self, ctx, ais_obj, visible: bool):
+        if ctx is None or ais_obj is None:
+            return
         try:
             if visible:
                 ctx.Display(ais_obj, False)
             else:
                 ctx.Erase(ais_obj, False)
-            ctx.UpdateCurrentViewer()
         except Exception:
             try:
                 if visible:
@@ -898,10 +1021,41 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _ais_list_from_data(self, ais_data):
+        if ais_data is None:
+            return []
+        if isinstance(ais_data, (list, tuple)):
+            return [a for a in ais_data if a is not None]
+        return [ais_data]
+
+    def _collect_tree_ais(self, item: QTreeWidgetItem):
+        ais_list = []
+        stack = [item]
+        while stack:
+            node = stack.pop()
+            ais_list.extend(self._ais_list_from_data(node.data(0, ROLE_AIS)))
+            for i in range(node.childCount()):
+                child = node.child(i)
+                if child is not None:
+                    stack.append(child)
+        return ais_list
+
+    def _apply_visibility_to_tree(self, item: QTreeWidgetItem, visible: bool, ctx):
+        if ctx is None or item is None:
+            return
+        ais_list = self._collect_tree_ais(item)
+        for ais in ais_list:
+            self._set_ais_visible_no_update(ctx, ais, visible)
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
     def _set_part_visible(self, payload: dict, visible: bool):
         if not isinstance(payload, dict):
             return
-        ais = payload.get("ais")
+        key = payload.get("key") or payload.get("name")
+        ais = payload.get("ais") or (self._assembly_ais.get(key) if key else None)
         if ais is None:
             return
         ctx = self._get_ctx()
@@ -911,7 +1065,7 @@ class MainWindow(QMainWindow):
             if visible:
                 ctx.Display(ais, False)
             else:
-                ctx.Remove(ais, False)
+                ctx.Erase(ais, False)
         except Exception:
             pass
 
@@ -1124,6 +1278,10 @@ class MainWindow(QMainWindow):
                 if self._selection_mode and self._current_shape is not None:
                     self._hover_move_to_debounced(event, 120)
 
+            if event.type() == QEvent.Wheel:
+                if self._zoom_at_cursor(event):
+                    return True
+
             # Click release: defer capture by 0ms so OCC finishes its internal update
             if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
                 QTimer.singleShot(0, self._capture_detected_object_after_click)
@@ -1247,19 +1405,22 @@ class MainWindow(QMainWindow):
         root = QTreeWidgetItem(self.tree, ["Model"])
         root.setFlags(root.flags() | Qt.ItemIsUserCheckable)
         root.setCheckState(0, Qt.Checked)
-        root.setData(0, Qt.UserRole, ("ROOT", None))
+        root.setData(0, ROLE_META, ("ROOT", None))
+        root.setData(0, ROLE_AIS, None)
 
         shapes = QTreeWidgetItem(root, ["Shapes"])
         shapes.setFlags(shapes.flags() | Qt.ItemIsUserCheckable)
         shapes.setCheckState(0, Qt.Checked)
-        shapes.setData(0, Qt.UserRole, ("GROUP_SHAPES", None))
+        shapes.setData(0, ROLE_META, ("GROUP_SHAPES", None))
+        shapes.setData(0, ROLE_AIS, None)
 
         self._add_toolpath_tree_nodes(root)
 
         polylines = QTreeWidgetItem(root, ["Polylines"])
         polylines.setFlags(polylines.flags() | Qt.ItemIsUserCheckable)
         polylines.setCheckState(0, Qt.Checked)
-        polylines.setData(0, Qt.UserRole, ("GROUP_POLYLINES", None))
+        polylines.setData(0, ROLE_META, ("GROUP_POLYLINES", None))
+        polylines.setData(0, ROLE_AIS, list(self._polyline_ais.values()))
 
         self.tree.expandAll()
         self.tree.blockSignals(False)
@@ -1267,7 +1428,8 @@ class MainWindow(QMainWindow):
     def _add_toolpath_tree_nodes(self, root_item: QTreeWidgetItem):
         toolpath = QTreeWidgetItem(root_item, ["Toolpath"])
         toolpath.setFlags(toolpath.flags() | Qt.ItemIsUserCheckable)
-        toolpath.setData(0, Qt.UserRole, ("GROUP_TOOLPATH", None))
+        toolpath.setData(0, ROLE_META, ("GROUP_TOOLPATH", None))
+        toolpath.setData(0, ROLE_AIS, [self._toolpath_g0_ais, self._toolpath_g1_ais])
         if self._toolpath_g0_visible and self._toolpath_g1_visible:
             toolpath.setCheckState(0, Qt.Checked)
         elif not self._toolpath_g0_visible and not self._toolpath_g1_visible:
@@ -1278,12 +1440,14 @@ class MainWindow(QMainWindow):
         g0_node = QTreeWidgetItem(toolpath, ["G0 Rapid"])
         g0_node.setFlags(g0_node.flags() | Qt.ItemIsUserCheckable)
         g0_node.setCheckState(0, Qt.Checked if self._toolpath_g0_visible else Qt.Unchecked)
-        g0_node.setData(0, Qt.UserRole, ("TOOLPATH_G0", None))
+        g0_node.setData(0, ROLE_META, ("TOOLPATH_G0", None))
+        g0_node.setData(0, ROLE_AIS, self._toolpath_g0_ais)
 
         g1_node = QTreeWidgetItem(toolpath, ["G1 Feed"])
         g1_node.setFlags(g1_node.flags() | Qt.ItemIsUserCheckable)
         g1_node.setCheckState(0, Qt.Checked if self._toolpath_g1_visible else Qt.Unchecked)
-        g1_node.setData(0, Qt.UserRole, ("TOOLPATH_G1", None))
+        g1_node.setData(0, ROLE_META, ("TOOLPATH_G1", None))
+        g1_node.setData(0, ROLE_AIS, self._toolpath_g1_ais)
 
     def set_tree_for_step(self, file_path: str, edge_count: int):
         self.tree.blockSignals(True)
@@ -1292,38 +1456,45 @@ class MainWindow(QMainWindow):
         root = QTreeWidgetItem(self.tree, ["Model"])
         root.setFlags(root.flags() | Qt.ItemIsUserCheckable)
         root.setCheckState(0, Qt.Checked)
-        root.setData(0, Qt.UserRole, ("ROOT", None))
+        root.setData(0, ROLE_META, ("ROOT", None))
+        root.setData(0, ROLE_AIS, None)
 
         shapes = QTreeWidgetItem(root, ["Shapes"])
         shapes.setFlags(shapes.flags() | Qt.ItemIsUserCheckable)
         shapes.setCheckState(0, Qt.Checked)
-        shapes.setData(0, Qt.UserRole, ("GROUP_SHAPES", None))
+        shapes.setData(0, ROLE_META, ("GROUP_SHAPES", None))
+        shapes.setData(0, ROLE_AIS, None)
 
         step_node = QTreeWidgetItem(shapes, [Path(file_path).name])
-        step_node.setData(0, Qt.UserRole, ("STEP_MODEL", "MODEL"))
+        step_node.setData(0, ROLE_META, ("STEP_MODEL", "MODEL"))
+        step_node.setData(0, ROLE_AIS, self._model_ais)
         step_node.setFlags(step_node.flags() | Qt.ItemIsUserCheckable)
         step_node.setCheckState(0, Qt.Checked)
 
         edges_info = QTreeWidgetItem(step_node, [f"Edges: {edge_count}"])
-        edges_info.setData(0, Qt.UserRole, ("INFO", None))
+        edges_info.setData(0, ROLE_META, ("INFO", None))
+        edges_info.setData(0, ROLE_AIS, None)
         edges_info.setFlags(edges_info.flags() & ~Qt.ItemIsUserCheckable)
 
         self._add_toolpath_tree_nodes(root)
 
         polylines = QTreeWidgetItem(root, ["Polylines"])
-        polylines.setData(0, Qt.UserRole, ("GROUP_POLYLINES", None))
+        polylines.setData(0, ROLE_META, ("GROUP_POLYLINES", None))
+        polylines.setData(0, ROLE_AIS, list(self._polyline_ais.values()))
         polylines.setFlags(polylines.flags() | Qt.ItemIsUserCheckable)
         polylines.setCheckState(0, Qt.Checked)
 
         for name, edge_ids in self._polylines.items():
             pnode = QTreeWidgetItem(polylines, [name])
-            pnode.setData(0, Qt.UserRole, ("POLYLINE", name))
+            pnode.setData(0, ROLE_META, ("POLYLINE", name))
+            pnode.setData(0, ROLE_AIS, self._polyline_ais.get(name))
             pnode.setFlags(pnode.flags() | Qt.ItemIsUserCheckable)
             pnode.setCheckState(0, Qt.Checked)
 
             for eid in edge_ids:
                 enode = QTreeWidgetItem(pnode, [f"Edge_{eid:04d}"])
-                enode.setData(0, Qt.UserRole, ("EDGE_REF", eid))
+                enode.setData(0, ROLE_META, ("EDGE_REF", eid))
+                enode.setData(0, ROLE_AIS, None)
                 enode.setFlags(enode.flags() & ~Qt.ItemIsUserCheckable)
 
         self.tree.expandAll()
@@ -1336,12 +1507,14 @@ class MainWindow(QMainWindow):
         root = QTreeWidgetItem(self.tree, ["Assembly"])
         root.setFlags(root.flags() | Qt.ItemIsUserCheckable)
         root.setCheckState(0, Qt.Checked)
-        root.setData(0, Qt.UserRole, {"type": "assembly"})
+        root.setData(0, ROLE_META, {"type": "assembly"})
+        root.setData(0, ROLE_AIS, None)
 
         shapes = QTreeWidgetItem(root, [Path(file_path).name])
         shapes.setFlags(shapes.flags() | Qt.ItemIsUserCheckable)
         shapes.setCheckState(0, Qt.Checked)
-        shapes.setData(0, Qt.UserRole, {"type": "group"})
+        shapes.setData(0, ROLE_META, {"type": "group"})
+        shapes.setData(0, ROLE_AIS, None)
 
         file_name_norm = Path(file_path).name.strip().casefold()
         for idx, part in enumerate(parts):
@@ -1360,37 +1533,40 @@ class MainWindow(QMainWindow):
             ais = self._assembly_ais.get(name)
             pnode.setData(
                 0,
-                Qt.UserRole,
+                ROLE_META,
                 {
                     "type": "part",
                     "kind": "STEP_PART",
                     "key": name,
                     "id": idx,
                     "shape": shape,
-                    "ais": ais,
                     "ais_edges": None,
                     "ais_hlr": None,
                 },
             )
+            pnode.setData(0, ROLE_AIS, ais)
             pnode.setFlags(pnode.flags() | Qt.ItemIsUserCheckable)
             pnode.setCheckState(0, Qt.Checked)
 
         self._add_toolpath_tree_nodes(root)
 
         polylines = QTreeWidgetItem(root, ["Polylines"])
-        polylines.setData(0, Qt.UserRole, ("GROUP_POLYLINES", None))
+        polylines.setData(0, ROLE_META, ("GROUP_POLYLINES", None))
+        polylines.setData(0, ROLE_AIS, list(self._polyline_ais.values()))
         polylines.setFlags(polylines.flags() | Qt.ItemIsUserCheckable)
         polylines.setCheckState(0, Qt.Checked)
 
         for name, edge_ids in self._polylines.items():
             pnode = QTreeWidgetItem(polylines, [name])
-            pnode.setData(0, Qt.UserRole, ("POLYLINE", name))
+            pnode.setData(0, ROLE_META, ("POLYLINE", name))
+            pnode.setData(0, ROLE_AIS, self._polyline_ais.get(name))
             pnode.setFlags(pnode.flags() | Qt.ItemIsUserCheckable)
             pnode.setCheckState(0, Qt.Checked)
 
             for eid in edge_ids:
                 enode = QTreeWidgetItem(pnode, [f"Edge_{eid:04d}"])
-                enode.setData(0, Qt.UserRole, ("EDGE_REF", eid))
+                enode.setData(0, ROLE_META, ("EDGE_REF", eid))
+                enode.setData(0, ROLE_AIS, None)
                 enode.setFlags(enode.flags() & ~Qt.ItemIsUserCheckable)
 
         self.tree.expandAll()
@@ -1413,22 +1589,14 @@ class MainWindow(QMainWindow):
                     if child.flags() & Qt.ItemIsUserCheckable:
                         child.setCheckState(0, check_state)
                     stack.append(child)
-                    payload = child.data(0, Qt.UserRole)
-                    if isinstance(payload, dict):
-                        ptype = payload.get("type")
-                        if ptype == "part" or payload.get("kind") == "STEP_PART":
-                            self._set_part_visible(payload, visible)
         finally:
             self._tree_updating_checks = False
-        try:
-            ctx.UpdateCurrentViewer()
-        except Exception:
-            pass
+        self._apply_visibility_to_tree(item, visible, ctx)
 
     def on_tree_item_changed(self, item: QTreeWidgetItem, column: int):
         if self._tree_updating_checks:
             return
-        data = item.data(0, Qt.UserRole)
+        data = item.data(0, ROLE_META)
         if not data:
             return
 
@@ -1445,23 +1613,6 @@ class MainWindow(QMainWindow):
             self._mark_dirty()
         if payload_type in ("group", "assembly"):
             self._propagate_group_check_and_visibility(item, visible)
-            return
-
-        if isinstance(payload, dict) and (payload.get("ais") is not None or self._model_ais is not None):
-            ctx = self._get_ctx()
-            if ctx is None:
-                return
-            try:
-                ais = (payload.get("ais") if isinstance(payload, dict) else None) or self._model_ais
-                if ais is None:
-                    return
-                if visible:
-                    ctx.Display(ais, False)
-                else:
-                    ctx.Remove(ais, False)
-                ctx.UpdateCurrentViewer()
-            except Exception:
-                pass
             return
 
         if kind == "GROUP_TOOLPATH":
@@ -1497,21 +1648,15 @@ class MainWindow(QMainWindow):
                         child.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
             finally:
                 self._tree_updating_checks = False
+            ctx = self._get_ctx()
+            if ctx is not None:
+                self._apply_visibility_to_tree(item, visible, ctx)
             return
 
-        if kind == "STEP_MODEL" and key == "MODEL":
-            self._set_ais_visible(self._model_ais, visible)
+        ctx = self._get_ctx()
+        if ctx is None:
             return
-
-        if kind == "POLYLINE" and isinstance(key, str):
-            ais = self._polyline_ais.get(key)
-            self._set_ais_visible(ais, visible)
-            return
-
-        if kind == "GROUP_POLYLINES":
-            for _, ais in self._polyline_ais.items():
-                self._set_ais_visible(ais, visible)
-            return
+        self._apply_visibility_to_tree(item, visible, ctx)
 
     def on_tree_selection_changed(self):
         selected_items = self.tree.selectedItems()
@@ -1520,7 +1665,7 @@ class MainWindow(QMainWindow):
             return
 
         item = selected_items[0]
-        data = item.data(0, Qt.UserRole)
+        data = item.data(0, ROLE_META)
         if not data:
             self._tree_unhighlight()
             return
@@ -1619,25 +1764,19 @@ class MainWindow(QMainWindow):
 
     def _delete_tree_item(self, item):
         try:
-            payload = item.data(0, Qt.UserRole)
-        except Exception:
-            payload = None
-        if isinstance(payload, dict):
-            ais = payload.get("ais")
-            try:
-                ctx = self._get_ctx()
-                if ctx is not None:
-                    if ais is not None:
-                        try:
-                            ctx.Remove(ais, False)
-                        except Exception:
-                            pass
+            ctx = self._get_ctx()
+            if ctx is not None:
+                for ais in self._ais_list_from_data(item.data(0, ROLE_AIS)):
                     try:
-                        ctx.UpdateCurrentViewer()
+                        ctx.Remove(ais, False)
                     except Exception:
                         pass
-            except Exception:
-                pass
+                try:
+                    ctx.UpdateCurrentViewer()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         parent = item.parent()
         self.tree.blockSignals(True)
         try:
@@ -1653,7 +1792,7 @@ class MainWindow(QMainWindow):
     def _clone_subtree(self, src_item):
         clone = QTreeWidgetItem()
         clone.setText(0, src_item.text(0))
-        for role in (Qt.UserRole,):
+        for role in (ROLE_AIS, ROLE_META, ROLE_COLOR):
             try:
                 clone.setData(0, role, src_item.data(0, role))
             except Exception:
@@ -1686,7 +1825,7 @@ class MainWindow(QMainWindow):
 
         self.tree.blockSignals(True)
         try:
-            item.setData(0, Qt.UserRole + 1, (c.red(), c.green(), c.blue()))
+            item.setData(0, ROLE_COLOR, (c.red(), c.green(), c.blue()))
         finally:
             self.tree.blockSignals(False)
 
@@ -1745,11 +1884,11 @@ class MainWindow(QMainWindow):
         parent_name = item.parent().text(0) if item.parent() else "(top-level)"
         payload = None
         try:
-            payload = item.data(0, Qt.UserRole)
+            payload = item.data(0, ROLE_META)
         except Exception:
             payload = None
 
-        msg = f"Name: {name}\nParent: {parent_name}\nChildren: {child_count}\nUserRole: {payload!r}"
+        msg = f"Name: {name}\nParent: {parent_name}\nChildren: {child_count}\nMeta: {payload!r}"
         try:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(self, "Properties", msg)
@@ -1758,7 +1897,17 @@ class MainWindow(QMainWindow):
 
     def _resolve_ais_from_tree_item(self, item):
         try:
-            payload = item.data(0, Qt.UserRole)
+            ais_payload = item.data(0, ROLE_AIS)
+        except Exception:
+            ais_payload = None
+        if isinstance(ais_payload, (list, tuple)):
+            for ais in ais_payload:
+                if ais is not None:
+                    return ais
+        if ais_payload is not None:
+            return ais_payload
+        try:
+            payload = item.data(0, ROLE_META)
         except Exception:
             payload = None
 
@@ -2034,14 +2183,15 @@ class MainWindow(QMainWindow):
     def _iter_leaf_parts(self):
         top = self.tree.invisibleRootItem()
         for it in self._iter_tree_items(top):
-            payload = it.data(0, Qt.UserRole)
+            payload = it.data(0, ROLE_META)
             if not isinstance(payload, dict):
                 continue
-            if payload.get("ais") is None:
+            if not self._ais_list_from_data(it.data(0, ROLE_AIS)):
                 continue
             yield it, payload
 
     def closeEvent(self, event):
+        self._save_splitter_sizes()
         if self._maybe_save_changes():
             event.accept()
         else:
@@ -2203,7 +2353,7 @@ class MainWindow(QMainWindow):
         return comp_mk.Compound()
 
     def _ensure_part_hlr_overlay(self, item):
-        payload = item.data(0, Qt.UserRole)
+        payload = item.data(0, ROLE_META)
         if not isinstance(payload, dict):
             return
         shape = payload.get("shape")
@@ -2222,7 +2372,7 @@ class MainWindow(QMainWindow):
         ais_hlr = payload.get("ais_hlr")
         ais_hlr = AIS_Shape(edge_shape)
         payload["ais_hlr"] = ais_hlr
-        item.setData(0, Qt.UserRole, payload)
+        item.setData(0, ROLE_META, payload)
 
         try:
             ctx.SetDisplayMode(ais_hlr, 0, False)
@@ -2265,7 +2415,7 @@ class MainWindow(QMainWindow):
                 pass
         top = self.tree.invisibleRootItem()
         for it in self._iter_tree_items(top):
-            payload = it.data(0, Qt.UserRole)
+            payload = it.data(0, ROLE_META)
             if not isinstance(payload, dict):
                 continue
             if payload.get("kind") != "STEP_PART":
@@ -2273,7 +2423,7 @@ class MainWindow(QMainWindow):
             if it.checkState(0) != Qt.Checked:
                 continue
             key = payload.get("key") or payload.get("name") or it.text(0)
-            ais = payload.get("ais") or self._assembly_ais.get(key)
+            ais = it.data(0, ROLE_AIS) or self._assembly_ais.get(key)
             if ais is None:
                 continue
             try:
@@ -2301,14 +2451,15 @@ class MainWindow(QMainWindow):
 
         top = self.tree.invisibleRootItem()
         for it in self._iter_tree_items(top):
-            payload = it.data(0, Qt.UserRole)
+            payload = it.data(0, ROLE_META)
             if not isinstance(payload, dict):
                 continue
             if payload.get("kind") != "STEP_PART":
                 continue
             if it.checkState(0) != Qt.Checked:
                 continue
-            ais = payload.get("ais")
+            key = payload.get("key") or payload.get("name") or it.text(0)
+            ais = it.data(0, ROLE_AIS) or self._assembly_ais.get(key)
             if ais is None:
                 continue
             try:
@@ -2323,6 +2474,33 @@ class MainWindow(QMainWindow):
             ctx.UpdateCurrentViewer()
         except Exception:
             pass
+
+    def _save_splitter_sizes(self):
+        if not hasattr(self, "_settings"):
+            return
+        if not hasattr(self, "_main_splitter") or self._main_splitter is None:
+            return
+        try:
+            sizes = self._main_splitter.sizes()
+            if len(sizes) == 2:
+                self._settings.setValue("code_splitter_sizes", [int(sizes[0]), int(sizes[1])])
+        except Exception:
+            pass
+
+    def _toggle_code_panel(self):
+        if not hasattr(self, "_main_splitter") or self._main_splitter is None:
+            return
+        sizes = self._main_splitter.sizes()
+        if len(sizes) != 2:
+            return
+        total = sum(sizes)
+        if sizes[1] <= 0:
+            left = int(total * 0.8)
+            right = max(0, total - left)
+            self._main_splitter.setSizes([left, right])
+        else:
+            self._main_splitter.setSizes([total, 0])
+        self._save_splitter_sizes()
 
     def _mesh_shape(self, shape):
         if shape is None:
@@ -2365,10 +2543,7 @@ class MainWindow(QMainWindow):
             pass
 
     # ---------------- NC program dock ----------------
-    def _build_nc_dock(self):
-        dock = QDockWidget("NC Program", self)
-        dock.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
-
+    def _build_nc_panel(self):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -2401,9 +2576,7 @@ class MainWindow(QMainWindow):
         self._nc_view.setReadOnly(True)
         layout.addWidget(self._nc_view, 1)
 
-        dock.setWidget(container)
-        self.addDockWidget(Qt.RightDockWidgetArea, dock)
-        self._nc_dock = dock
+        self._nc_dock = None
         self._nc_btn_play.clicked.connect(self._nc_play_pause)
         self._nc_btn_stop.clicked.connect(self._nc_stop)
         self._nc_btn_prev.clicked.connect(self._nc_step_prev)
@@ -2411,6 +2584,7 @@ class MainWindow(QMainWindow):
         self._nc_speed_spin.valueChanged.connect(self._nc_speed_changed)
         self._nc_line_slider.valueChanged.connect(self._nc_slider_changed)
         print("[NC] Playback controls added to NC Program dock")
+        return container
 
     def load_nc_program(self, file_path: str):
         try:
@@ -2427,12 +2601,13 @@ class MainWindow(QMainWindow):
         cur_x = 0.0
         cur_y = 0.0
         cur_z = 0.0
+        cur_a = 0.0
         cur_b = 0.0
         cur_c = 0.0
         last_g = "G0"
         last_point_idx = -1
         axis_re = re.compile(r"([XYZ])\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
-        bc_re = re.compile(r"([BC])\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+        abc_re = re.compile(r"([ABC])\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
 
         for line in lines:
             if re.search(r"\bG0\b|\bG00\b", line, re.IGNORECASE):
@@ -2440,11 +2615,13 @@ class MainWindow(QMainWindow):
             elif re.search(r"\bG1\b|\bG01\b", line, re.IGNORECASE):
                 last_g = "G1"
 
-            bc_matches = list(bc_re.finditer(line))
-            for m in bc_matches:
+            abc_matches = list(abc_re.finditer(line))
+            for m in abc_matches:
                 axis = m.group(1).upper()
                 val = float(m.group(2))
-                if axis == "B":
+                if axis == "A":
+                    cur_a = val
+                elif axis == "B":
                     cur_b = val
                 elif axis == "C":
                     cur_c = val
@@ -2474,7 +2651,7 @@ class MainWindow(QMainWindow):
                     points.append((cur_x, cur_y, cur_z))
                     last_point_idx = len(points) - 1
             line_to_point.append(last_point_idx)
-            line_state.append({"pos": (cur_x, cur_y, cur_z), "b": cur_b, "c": cur_c})
+            line_state.append({"pos": (cur_x, cur_y, cur_z), "a": cur_a, "b": cur_b, "c": cur_c})
 
         self._nc_lines = lines
         self._nc_points = points
@@ -2883,6 +3060,7 @@ class MainWindow(QMainWindow):
         ctx = self._get_ctx()
         if ctx is None:
             self._tool_body_ais = None
+            self._tool_body_dims = None
             return
         if self._tool_body_ais is not None:
             try:
@@ -2890,6 +3068,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._tool_body_ais = None
+            self._tool_body_dims = None
 
     def _update_tool_body_for_line(self, index: int):
         if not self._nc_line_state or index < 0 or index >= len(self._nc_line_state):
@@ -2900,6 +3079,7 @@ class MainWindow(QMainWindow):
             return
         state = self._nc_line_state[index]
         pos = state.get("pos")
+        a_deg = float(state.get("a", 0.0))
         b_deg = float(state.get("b", 0.0))
         c_deg = float(state.get("c", 0.0))
         if not pos or len(pos) < 3:
@@ -2918,35 +3098,59 @@ class MainWindow(QMainWindow):
                 dir_unit = gp_Dir(dir_vec)
             except Exception:
                 dir_unit = gp_Dir(0, 0, -1)
-            base_vec = gp_Vec(dir_unit)
-            base_vec.Multiply(float(self._tool_length_mm))
-            p_base = p_tip.Translated(base_vec.Reversed())
-            ax2 = gp_Ax2(p_base, dir_unit)
+            length = float(self._tool_length_mm)
             radius = float(self._tool_diameter_mm) * 0.5
-            cyl = BRepPrimAPI_MakeCylinder(ax2, radius, float(self._tool_length_mm)).Shape()
-            ais = AIS_Shape(cyl)
-            try:
-                ais.SetColor(Quantity_Color(0.2, 0.9, 0.2, Quantity_TOC_RGB))
-            except Exception:
-                pass
-            try:
-                ais.SetTransparency(0.3)
-            except Exception:
-                pass
-            if self._tool_body_ais is not None:
+
+            if self._tool_body_ais is None or self._tool_body_dims != (radius, length):
+                cyl = BRepPrimAPI_MakeCylinder(radius, length).Shape()
+                ais = AIS_Shape(cyl)
                 try:
-                    ctx.Remove(self._tool_body_ais, False)
+                    ais.SetColor(Quantity_Color(0.2, 0.9, 0.2, Quantity_TOC_RGB))
                 except Exception:
                     pass
-            ctx.Display(ais, False)
-            try:
-                ctx.Deactivate(ais)
-            except Exception:
                 try:
-                    ctx.SetSelectable(ais, False)
+                    ais.SetTransparency(0.3)
                 except Exception:
                     pass
-            self._tool_body_ais = ais
+                if self._tool_body_ais is not None:
+                    try:
+                        ctx.Remove(self._tool_body_ais, False)
+                    except Exception:
+                        pass
+                ctx.Display(ais, False)
+                try:
+                    ctx.Deactivate(ais)
+                except Exception:
+                    try:
+                        ctx.SetSelectable(ais, False)
+                    except Exception:
+                        pass
+                self._tool_body_ais = ais
+                self._tool_body_dims = (radius, length)
+
+            ax_x = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0))
+            ax_y = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0))
+            ax_z = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))
+
+            trsf = gp_Trsf()
+            trsf.SetRotation(ax_z, math.radians(c_deg))
+            trsf_b = gp_Trsf()
+            trsf_b.SetRotation(ax_y, math.radians(b_deg))
+            trsf.Multiply(trsf_b)
+            trsf_a = gp_Trsf()
+            trsf_a.SetRotation(ax_x, math.radians(a_deg))
+            trsf.Multiply(trsf_a)
+
+            tip_vec = gp_Vec(0, 0, length)
+            tip_vec.Transform(trsf)
+            trans = gp_Trsf()
+            trans.SetTranslation(gp_Vec(p_tip.X() - tip_vec.X(), p_tip.Y() - tip_vec.Y(), p_tip.Z() - tip_vec.Z()))
+            trans.Multiply(trsf)
+            self._tool_body_ais.SetLocalTransformation(trans)
+            try:
+                ctx.Redisplay(self._tool_body_ais, False)
+            except Exception:
+                pass
             ctx.UpdateCurrentViewer()
             print(f"[TOOL] Updated: dia={self._tool_diameter_mm} len={self._tool_length_mm} line={index + 1}")
         except Exception:
