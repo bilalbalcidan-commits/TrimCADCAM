@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QPixmap,
     QColor,
     QShortcut,
@@ -61,6 +62,7 @@ from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCC.Core.BRep import BRep_Builder
 from OCC.Core.TopoDS import TopoDS_Compound
 from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 
 from OCC.Core.Aspect import Aspect_TOL_SOLID, Aspect_TOTP_LEFT_LOWER
 from OCC.Core.V3d import V3d_ZBUFFER
@@ -375,7 +377,7 @@ def _extract_solids(shape):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TrimCADCAM - STEP Viewer")
+        self.setWindowTitle("MataTRIM")
         self.resize(1600, 950)
 
         # ---- DATA ----
@@ -419,6 +421,7 @@ class MainWindow(QMainWindow):
         self._invert_body_user_set = False
         self._tool_body_ais = None
         print("[VEC] Default convention set to C")
+        self._mesh_quality = "Medium"
 
         self._last_click_shift = False
 
@@ -556,6 +559,19 @@ class MainWindow(QMainWindow):
         act_settings = QAction("Settings...", self)
         act_settings.triggered.connect(self._open_machining_settings)
         machining_menu.addAction(act_settings)
+
+        view_menu = menubar.addMenu("View")
+        mesh_menu = view_menu.addMenu("Mesh Quality")
+        mesh_group = QActionGroup(self)
+        mesh_group.setExclusive(True)
+        for label in ("Low", "Medium", "High"):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            if label == self._mesh_quality:
+                act.setChecked(True)
+            act.triggered.connect(lambda _, q=label: self._set_mesh_quality(q))
+            mesh_group.addAction(act)
+            mesh_menu.addAction(act)
 
         self.act_start_poly = QAction("Start Polyline Select", self)
         self.act_start_poly.setCheckable(True)
@@ -2080,6 +2096,8 @@ class MainWindow(QMainWindow):
                 ctx = self._get_ctx()
                 if ctx is not None:
                     self._clear_assembly_display()
+                    for part in self._assembly_parts:
+                        self._mesh_shape(part.get("shape"))
                     if self._model_ais is not None:
                         try:
                             ctx.Remove(self._model_ais, True)
@@ -2107,6 +2125,7 @@ class MainWindow(QMainWindow):
                         pass
             else:
                 self._clear_assembly_display()
+                self._mesh_shape(display_shape)
                 self._display_model(display_shape)
             self.viewer._display.FitAll()
 
@@ -2302,6 +2321,46 @@ class MainWindow(QMainWindow):
 
         try:
             ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
+    def _mesh_shape(self, shape):
+        if shape is None:
+            return
+        lin_defl, ang_defl = self._mesh_quality_params(self._mesh_quality)
+        try:
+            # Smaller deflection values give smoother triangulation.
+            BRepMesh_IncrementalMesh(shape, lin_defl, False, ang_defl, True)
+        except Exception:
+            pass
+
+    def _mesh_quality_params(self, quality: str):
+        if quality == "Low":
+            return 0.25, 0.5
+        if quality == "High":
+            return 0.02, 0.15
+        return 0.10, 0.3
+
+    def _set_mesh_quality(self, quality: str):
+        self._mesh_quality = str(quality)
+        self._remesh_current_model()
+
+    def _remesh_current_model(self):
+        if self._current_shape is None:
+            return
+        if self._assembly_parts:
+            for part in self._assembly_parts:
+                self._mesh_shape(part.get("shape"))
+        else:
+            self._mesh_shape(self._current_shape)
+        ctx = self._get_ctx()
+        if ctx is not None:
+            try:
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
+        try:
+            self.viewer._display.Repaint()
         except Exception:
             pass
 
@@ -3159,7 +3218,12 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    icon_path = Path(__file__).resolve().parents[2] / "assets" / "mata_trim.ico"
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
     w = MainWindow()
+    if icon_path.is_file():
+        w.setWindowIcon(QIcon(str(icon_path)))
     splash = None
     splash_path = Path(__file__).resolve().parents[2] / "assets" / "splash.png"
     if splash_path.is_file():
