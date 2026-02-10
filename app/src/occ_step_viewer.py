@@ -18,6 +18,11 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QLabel,
     QPushButton,
+    QDialog,
+    QFormLayout,
+    QDoubleSpinBox,
+    QCheckBox,
+    QDialogButtonBox,
     QSpinBox,
     QSlider,
     QTreeWidget,
@@ -47,7 +52,7 @@ from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_SOLID
 from OCC.Core.TopoDS import topods
 
-from OCC.Core.AIS import AIS_Shape
+from OCC.Core.AIS import AIS_Shape, AIS_Trihedron
 from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB, Quantity_NOC_YELLOW
 from OCC.Core.Prs3d import Prs3d_Drawer
 
@@ -67,7 +72,9 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QToolButton, QGraphicsDropShadowEffect
 from PySide6.QtSvg import QSvgRenderer
 
-from OCC.Core.gp import gp_Dir, gp_Pnt
+from OCC.Core.gp import gp_Dir, gp_Pnt, gp_Ax1, gp_Ax2, gp_Vec
+from OCC.Core.Geom import Geom_Axis2Placement
+import math
 
 
 def _svg_icon(svg: str, size: int = 20) -> QIcon:
@@ -376,19 +383,33 @@ class MainWindow(QMainWindow):
 
         self._edge_list = []
         self._selection_mode = False
-        self._toolpath_ais = None
-        self._toolpath_visible = True
+        self._toolpath_g0_ais = None
+        self._toolpath_g1_ais = None
+        self._toolpath_g0_visible = True
+        self._toolpath_g1_visible = True
         self._nc_lines = []
         self._nc_points = []
         self._nc_line_to_point = []
+        self._nc_segments_g0 = []
+        self._nc_segments_g1 = []
+        self._nc_line_state = []
         self._nc_current_line = 0
         self._nc_timer = QTimer(self)
         self._nc_speed_ms = 200
         self._nc_slider_updating = False
+        self._nc_play_action = None
+        self._show_vectors_action = None
         self._selected_edge_ids = []
         self._polyline_counter = 0
         self._polylines = {}
         self._assembly_parts = []
+
+        self._tool_diameter_mm = 10.0
+        self._tool_length_mm = 100.0
+        self._vector_sampling_n = 5
+        self._show_tool_vectors = True
+        self._tool_vec_current_ais = None
+        self._tool_vec_samples_ais = None
 
         self._last_click_shift = False
 
@@ -410,6 +431,7 @@ class MainWindow(QMainWindow):
 
         # Displayed objects (hide/show)
         self._model_ais = None
+        self._model_csys_ais = None
         self._polyline_ais = {}  # name -> AIS_Shape
         self._assembly_ais = {}  # part name -> AIS_Shape
         self._assembly_edges_ais = {}  # part name -> AIS_Shape (wireframe overlay)
@@ -478,12 +500,6 @@ class MainWindow(QMainWindow):
         open_action = QAction("Open STEP...", self)
         open_action.triggered.connect(self.open_step_dialog)
         file_menu.addAction(open_action)
-        load_tp_action = QAction("Load NC Toolpath...", self)
-        load_tp_action.triggered.connect(self.open_nc_program_dialog)
-        file_menu.addAction(load_tp_action)
-        clear_tp_action = QAction("Clear Toolpath", self)
-        clear_tp_action.triggered.connect(self.clear_toolpath)
-        file_menu.addAction(clear_tp_action)
         save_asm_action = QAction("Save Assembly", self)
         save_asm_action.triggered.connect(self.on_save_assembly)
         file_menu.addAction(save_asm_action)
@@ -496,6 +512,41 @@ class MainWindow(QMainWindow):
         close_program_action = QAction("Close Program", self)
         close_program_action.triggered.connect(self.on_close_program)
         file_menu.addAction(close_program_action)
+
+        menubar.addMenu("CAD")
+
+        machining_menu = menubar.addMenu("Machining Strategy")
+        load_tp_action = QAction("Load NC Toolpath/Program", self)
+        load_tp_action.triggered.connect(self.open_nc_program_dialog)
+        machining_menu.addAction(load_tp_action)
+        clear_tp_action = QAction("Clear Toolpath", self)
+        clear_tp_action.triggered.connect(self.clear_toolpath)
+        machining_menu.addAction(clear_tp_action)
+        machining_menu.addSeparator()
+
+        self._nc_play_action = QAction("Play", self)
+        self._nc_play_action.triggered.connect(self._nc_play_pause)
+        machining_menu.addAction(self._nc_play_action)
+        act_stop = QAction("Stop", self)
+        act_stop.triggered.connect(self._nc_stop)
+        machining_menu.addAction(act_stop)
+        act_prev = QAction("Step -", self)
+        act_prev.triggered.connect(self._nc_step_prev)
+        machining_menu.addAction(act_prev)
+        act_next = QAction("Step +", self)
+        act_next.triggered.connect(self._nc_step_next)
+        machining_menu.addAction(act_next)
+        machining_menu.addSeparator()
+
+        self._show_vectors_action = QAction("Show tool vectors", self)
+        self._show_vectors_action.setCheckable(True)
+        self._show_vectors_action.setChecked(self._show_tool_vectors)
+        self._show_vectors_action.triggered.connect(self._toggle_show_tool_vectors)
+        machining_menu.addAction(self._show_vectors_action)
+
+        act_settings = QAction("Settings...", self)
+        act_settings.triggered.connect(self._open_machining_settings)
+        machining_menu.addAction(act_settings)
 
         # Toolbar
         tb = QToolBar("Tools")
@@ -570,6 +621,35 @@ class MainWindow(QMainWindow):
         if disp is None:
             return None
         return getattr(disp, "Context", None)
+
+    def _ensure_model_csys(self):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        if self._model_csys_ais is None:
+            try:
+                ax2 = gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), gp_Dir(1, 0, 0))
+                geom_ax2 = Geom_Axis2Placement(ax2)
+                self._model_csys_ais = AIS_Trihedron(geom_ax2)
+                try:
+                    self._model_csys_ais.SetSize(60.0)
+                except Exception:
+                    pass
+            except Exception:
+                self._model_csys_ais = None
+                return
+        try:
+            ctx.Display(self._model_csys_ais, False)
+            try:
+                ctx.Deactivate(self._model_csys_ais)
+            except Exception:
+                try:
+                    ctx.SetSelectable(self._model_csys_ais, False)
+                except Exception:
+                    pass
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
 
     def _apply_catia_shaded_style(self, ais_obj):
         if ais_obj is None:
@@ -1151,6 +1231,8 @@ class MainWindow(QMainWindow):
         shapes.setCheckState(0, Qt.Checked)
         shapes.setData(0, Qt.UserRole, ("GROUP_SHAPES", None))
 
+        self._add_toolpath_tree_nodes(root)
+
         polylines = QTreeWidgetItem(root, ["Polylines"])
         polylines.setFlags(polylines.flags() | Qt.ItemIsUserCheckable)
         polylines.setCheckState(0, Qt.Checked)
@@ -1158,6 +1240,27 @@ class MainWindow(QMainWindow):
 
         self.tree.expandAll()
         self.tree.blockSignals(False)
+
+    def _add_toolpath_tree_nodes(self, root_item: QTreeWidgetItem):
+        toolpath = QTreeWidgetItem(root_item, ["Toolpath"])
+        toolpath.setFlags(toolpath.flags() | Qt.ItemIsUserCheckable)
+        toolpath.setData(0, Qt.UserRole, ("GROUP_TOOLPATH", None))
+        if self._toolpath_g0_visible and self._toolpath_g1_visible:
+            toolpath.setCheckState(0, Qt.Checked)
+        elif not self._toolpath_g0_visible and not self._toolpath_g1_visible:
+            toolpath.setCheckState(0, Qt.Unchecked)
+        else:
+            toolpath.setCheckState(0, Qt.PartiallyChecked)
+
+        g0_node = QTreeWidgetItem(toolpath, ["G0 Rapid"])
+        g0_node.setFlags(g0_node.flags() | Qt.ItemIsUserCheckable)
+        g0_node.setCheckState(0, Qt.Checked if self._toolpath_g0_visible else Qt.Unchecked)
+        g0_node.setData(0, Qt.UserRole, ("TOOLPATH_G0", None))
+
+        g1_node = QTreeWidgetItem(toolpath, ["G1 Feed"])
+        g1_node.setFlags(g1_node.flags() | Qt.ItemIsUserCheckable)
+        g1_node.setCheckState(0, Qt.Checked if self._toolpath_g1_visible else Qt.Unchecked)
+        g1_node.setData(0, Qt.UserRole, ("TOOLPATH_G1", None))
 
     def set_tree_for_step(self, file_path: str, edge_count: int):
         self.tree.blockSignals(True)
@@ -1181,6 +1284,8 @@ class MainWindow(QMainWindow):
         edges_info = QTreeWidgetItem(step_node, [f"Edges: {edge_count}"])
         edges_info.setData(0, Qt.UserRole, ("INFO", None))
         edges_info.setFlags(edges_info.flags() & ~Qt.ItemIsUserCheckable)
+
+        self._add_toolpath_tree_nodes(root)
 
         polylines = QTreeWidgetItem(root, ["Polylines"])
         polylines.setData(0, Qt.UserRole, ("GROUP_POLYLINES", None))
@@ -1246,6 +1351,8 @@ class MainWindow(QMainWindow):
             )
             pnode.setFlags(pnode.flags() | Qt.ItemIsUserCheckable)
             pnode.setCheckState(0, Qt.Checked)
+
+        self._add_toolpath_tree_nodes(root)
 
         polylines = QTreeWidgetItem(root, ["Polylines"])
         polylines.setData(0, Qt.UserRole, ("GROUP_POLYLINES", None))
@@ -1334,6 +1441,30 @@ class MainWindow(QMainWindow):
                 pass
             return
 
+        if kind == "GROUP_TOOLPATH":
+            self._tree_updating_checks = True
+            try:
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    if child is not None:
+                        child.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
+            finally:
+                self._tree_updating_checks = False
+            self._toolpath_g0_visible = bool(visible)
+            self._toolpath_g1_visible = bool(visible)
+            self._apply_toolpath_visibility()
+            return
+
+        if kind == "TOOLPATH_G0":
+            self._toolpath_g0_visible = bool(visible)
+            self._apply_toolpath_visibility()
+            return
+
+        if kind == "TOOLPATH_G1":
+            self._toolpath_g1_visible = bool(visible)
+            self._apply_toolpath_visibility()
+            return
+
         if item.childCount() > 0 and kind != "STEP_PART":
             self._tree_updating_checks = True
             try:
@@ -1392,7 +1523,7 @@ class MainWindow(QMainWindow):
         if item is None:
             return
 
-        locked = {"Assembly", "Polylines"}
+        locked = {"Assembly", "Polylines", "Toolpath", "G0 Rapid", "G1 Feed"}
         if item.text(0) in locked:
             return
 
@@ -1981,6 +2112,8 @@ class MainWindow(QMainWindow):
                 self._assembly_parts = []
                 self.set_tree_for_step(file_path, edge_count)
             self._apply_view_mode()
+            self._ensure_model_csys()
+            print("[MODEL] CSYS shown for loaded STEP")
             self._is_dirty = False
             print("[MODEL] FitAll")
 
@@ -2177,24 +2310,11 @@ class MainWindow(QMainWindow):
         self._nc_status_label = QLabel("Line: 0/0  Points: 0/0")
         layout.addWidget(self._nc_status_label)
 
-        controls = QHBoxLayout()
-        self._nc_btn_load = QPushButton("Load NC")
-        self._nc_btn_play = QPushButton("Play")
-        self._nc_btn_stop = QPushButton("Stop")
-        self._nc_btn_prev = QPushButton("Step -")
-        self._nc_btn_next = QPushButton("Step +")
-        controls.addWidget(self._nc_btn_load)
-        controls.addWidget(self._nc_btn_play)
-        controls.addWidget(self._nc_btn_stop)
-        controls.addWidget(self._nc_btn_prev)
-        controls.addWidget(self._nc_btn_next)
-
-        controls.addWidget(QLabel("Speed (ms):"))
-        self._nc_speed_spin = QSpinBox()
-        self._nc_speed_spin.setRange(20, 1000)
-        self._nc_speed_spin.setValue(self._nc_speed_ms)
-        controls.addWidget(self._nc_speed_spin)
-        layout.addLayout(controls)
+        self._nc_btn_load = None
+        self._nc_btn_play = None
+        self._nc_btn_stop = None
+        self._nc_btn_prev = None
+        self._nc_btn_next = None
 
         self._nc_line_slider = QSlider(Qt.Horizontal)
         self._nc_line_slider.setRange(0, 0)
@@ -2207,13 +2327,6 @@ class MainWindow(QMainWindow):
         dock.setWidget(container)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self._nc_dock = dock
-
-        self._nc_btn_load.clicked.connect(self.open_nc_program_dialog)
-        self._nc_btn_play.clicked.connect(self._nc_play_pause)
-        self._nc_btn_stop.clicked.connect(self._nc_stop)
-        self._nc_btn_prev.clicked.connect(self._nc_step_prev)
-        self._nc_btn_next.clicked.connect(self._nc_step_next)
-        self._nc_speed_spin.valueChanged.connect(self._nc_speed_changed)
         self._nc_line_slider.valueChanged.connect(self._nc_slider_changed)
 
     def load_nc_program(self, file_path: str):
@@ -2225,13 +2338,34 @@ class MainWindow(QMainWindow):
 
         points = []
         line_to_point = []
+        segments_g0 = []
+        segments_g1 = []
+        line_state = []
         cur_x = 0.0
         cur_y = 0.0
         cur_z = 0.0
+        cur_b = 0.0
+        cur_c = 0.0
+        last_g = "G0"
         last_point_idx = -1
         axis_re = re.compile(r"([XYZ])\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
+        bc_re = re.compile(r"([BC])\s*([+-]?\d+(?:\.\d+)?)", re.IGNORECASE)
 
         for line in lines:
+            if re.search(r"\bG0\b|\bG00\b", line, re.IGNORECASE):
+                last_g = "G0"
+            elif re.search(r"\bG1\b|\bG01\b", line, re.IGNORECASE):
+                last_g = "G1"
+
+            bc_matches = list(bc_re.finditer(line))
+            for m in bc_matches:
+                axis = m.group(1).upper()
+                val = float(m.group(2))
+                if axis == "B":
+                    cur_b = val
+                elif axis == "C":
+                    cur_c = val
+
             matches = list(axis_re.finditer(line))
             if matches:
                 next_x = cur_x
@@ -2247,19 +2381,30 @@ class MainWindow(QMainWindow):
                     elif axis == "Z":
                         next_z = val
                 if (next_x, next_y, next_z) != (cur_x, cur_y, cur_z):
+                    p1 = (cur_x, cur_y, cur_z)
                     cur_x, cur_y, cur_z = next_x, next_y, next_z
+                    p2 = (cur_x, cur_y, cur_z)
+                    if last_g == "G0":
+                        segments_g0.append((p1, p2, len(line_state)))
+                    else:
+                        segments_g1.append((p1, p2, len(line_state)))
                     points.append((cur_x, cur_y, cur_z))
                     last_point_idx = len(points) - 1
             line_to_point.append(last_point_idx)
+            line_state.append({"pos": (cur_x, cur_y, cur_z), "b": cur_b, "c": cur_c})
 
         self._nc_lines = lines
         self._nc_points = points
         self._nc_line_to_point = line_to_point
+        self._nc_segments_g0 = segments_g0
+        self._nc_segments_g1 = segments_g1
+        self._nc_line_state = line_state
         self._nc_current_line = 0
 
         self._nc_view.setPlainText("\n".join(self._nc_lines))
         self._nc_line_slider.setRange(0, max(0, len(self._nc_lines) - 1))
         self._nc_line_slider.setValue(0)
+        self._rebuild_tool_vector_samples()
         self.set_nc_line(0, fitall=True)
         print(f"[NC] Loaded {len(points)} points from {Path(file_path).name}")
         print(f"[NC] Program loaded: {Path(file_path).name} lines={len(lines)} points={len(points)}")
@@ -2286,14 +2431,15 @@ class MainWindow(QMainWindow):
             f"Line: {idx + 1}/{len(self._nc_lines)}  Points: {visible_count}/{total_points}"
         )
 
-        if visible_count > 1:
-            self.load_toolpath_points(self._nc_points[:visible_count], fitall=fitall)
-        elif visible_count == 1:
-            self.load_toolpath_points(self._nc_points[:1], fitall=fitall)
+        g0_segments = [(p1, p2) for p1, p2, li in self._nc_segments_g0 if li <= idx]
+        g1_segments = [(p1, p2) for p1, p2, li in self._nc_segments_g1 if li <= idx]
+        if g0_segments or g1_segments:
+            self.load_toolpath_segments(g0_segments, g1_segments, fitall=fitall)
         else:
             self.clear_toolpath()
 
         self._highlight_nc_line(idx)
+        self._update_tool_vector_for_line(idx)
         print(f"[NC] Line {idx + 1}/{len(self._nc_lines)} points={visible_count}/{total_points}")
 
     def _highlight_nc_line(self, index: int):
@@ -2322,14 +2468,14 @@ class MainWindow(QMainWindow):
             return
         if self._nc_timer.isActive():
             self._nc_timer.stop()
-            self._nc_btn_play.setText("Play")
+            self._set_play_action_text("Play")
         else:
             self._nc_timer.start(self._nc_speed_ms)
-            self._nc_btn_play.setText("Pause")
+            self._set_play_action_text("Pause")
 
     def _nc_stop(self):
         self._nc_timer.stop()
-        self._nc_btn_play.setText("Play")
+        self._set_play_action_text("Play")
         self.set_nc_line(0, fitall=False)
 
     def _nc_step_next(self):
@@ -2348,7 +2494,7 @@ class MainWindow(QMainWindow):
             return
         if self._nc_current_line >= len(self._nc_lines) - 1:
             self._nc_timer.stop()
-            self._nc_btn_play.setText("Play")
+            self._set_play_action_text("Play")
             return
         self.set_nc_line(self._nc_current_line + 1, fitall=False)
 
@@ -2363,6 +2509,96 @@ class MainWindow(QMainWindow):
         self.set_nc_line(value, fitall=False)
 
     # ---------------- NC toolpath display ----------------
+    def _build_toolpath_ais(self, segments, color: Quantity_Color, width: float):
+        if not segments:
+            return None
+        ctx = self._get_ctx()
+        if ctx is None:
+            return None
+        comp = TopoDS_Compound()
+        builder = BRep_Builder()
+        builder.MakeCompound(comp)
+
+        for seg in segments:
+            if not seg or len(seg) < 2:
+                continue
+            try:
+                p1 = gp_Pnt(float(seg[0][0]), float(seg[0][1]), float(seg[0][2]))
+                p2 = gp_Pnt(float(seg[1][0]), float(seg[1][1]), float(seg[1][2]))
+            except Exception:
+                continue
+            try:
+                edge = BRepBuilderAPI_MakeEdge(p1, p2).Edge()
+                builder.Add(comp, edge)
+            except Exception:
+                pass
+
+        try:
+            ais = AIS_Shape(comp)
+            try:
+                ais.SetColor(color)
+            except Exception:
+                pass
+            try:
+                ais.SetWidth(width)
+            except Exception:
+                pass
+            ctx.Display(ais, False)
+            try:
+                ctx.Deactivate(ais)
+            except Exception:
+                try:
+                    ctx.SetSelectable(ais, False)
+                except Exception:
+                    pass
+            return ais
+        except Exception:
+            return None
+
+    def _apply_toolpath_visibility(self):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        if self._toolpath_g0_ais is not None:
+            try:
+                if self._toolpath_g0_visible:
+                    ctx.Display(self._toolpath_g0_ais, False)
+                else:
+                    ctx.Erase(self._toolpath_g0_ais, False)
+            except Exception:
+                pass
+        if self._toolpath_g1_ais is not None:
+            try:
+                if self._toolpath_g1_visible:
+                    ctx.Display(self._toolpath_g1_ais, False)
+                else:
+                    ctx.Erase(self._toolpath_g1_ais, False)
+            except Exception:
+                pass
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
+    def load_toolpath_segments(self, g0_segments, g1_segments, fitall: bool = True):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        self.clear_toolpath()
+
+        g0_color = Quantity_Color(0.7, 0.7, 0.7, Quantity_TOC_RGB)
+        g1_color = Quantity_NOC_YELLOW
+        self._toolpath_g0_ais = self._build_toolpath_ais(g0_segments, g0_color, 1.2)
+        self._toolpath_g1_ais = self._build_toolpath_ais(g1_segments, g1_color, 2.5)
+        self._apply_toolpath_visibility()
+
+        if fitall:
+            try:
+                self.viewer._display.FitAll()
+                print("[MODEL] FitAll")
+            except Exception:
+                pass
+
     def load_toolpath_points(self, points, fitall: bool = True):
         if not points:
             self.clear_toolpath()
@@ -2370,19 +2606,7 @@ class MainWindow(QMainWindow):
         ctx = self._get_ctx()
         if ctx is None:
             return
-        self.clear_toolpath()
-
-        comp = TopoDS_Compound()
-        builder = BRep_Builder()
-        builder.MakeCompound(comp)
-
-        def _add_edge(p1, p2):
-            try:
-                edge = BRepBuilderAPI_MakeEdge(p1, p2).Edge()
-                builder.Add(comp, edge)
-            except Exception:
-                pass
-
+        segments = []
         is_segments = False
         try:
             first = points[0]
@@ -2395,57 +2619,17 @@ class MainWindow(QMainWindow):
             for seg in points:
                 if not seg or len(seg) < 2:
                     continue
-                try:
-                    p1 = gp_Pnt(float(seg[0][0]), float(seg[0][1]), float(seg[0][2]))
-                    p2 = gp_Pnt(float(seg[1][0]), float(seg[1][1]), float(seg[1][2]))
-                except Exception:
-                    continue
-                _add_edge(p1, p2)
+                segments.append((seg[0], seg[1]))
         else:
             prev = None
             for p in points:
                 if p is None or len(p) < 3:
                     continue
-                try:
-                    pt = gp_Pnt(float(p[0]), float(p[1]), float(p[2]))
-                except Exception:
-                    continue
                 if prev is not None:
-                    _add_edge(prev, pt)
-                prev = pt
+                    segments.append((prev, p))
+                prev = p
 
-        try:
-            ais = AIS_Shape(comp)
-            try:
-                ais.SetColor(Quantity_NOC_YELLOW)
-            except Exception:
-                pass
-            try:
-                ais.SetWidth(2.5)
-            except Exception:
-                pass
-            ctx.Display(ais, False)
-            try:
-                ctx.Deactivate(ais)
-            except Exception:
-                try:
-                    ctx.SetSelectable(ais, False)
-                except Exception:
-                    pass
-            self._toolpath_ais = ais
-            self._toolpath_visible = True
-            try:
-                ctx.UpdateCurrentViewer()
-            except Exception:
-                pass
-            if fitall:
-                try:
-                    self.viewer._display.FitAll()
-                    print("[MODEL] FitAll")
-                except Exception:
-                    pass
-        except Exception:
-            self._toolpath_ais = None
+        self.load_toolpath_segments([], segments, fitall=fitall)
 
     def load_toolpath(self, points):
         self.load_toolpath_points(points, fitall=True)
@@ -2489,41 +2673,33 @@ class MainWindow(QMainWindow):
     def clear_toolpath(self):
         ctx = self._get_ctx()
         if ctx is None:
-            self._toolpath_ais = None
+            self._toolpath_g0_ais = None
+            self._toolpath_g1_ais = None
             return
-        if self._toolpath_ais is not None:
+        if self._toolpath_g0_ais is not None:
             try:
-                ctx.Remove(self._toolpath_ais, False)
+                ctx.Remove(self._toolpath_g0_ais, False)
             except Exception:
                 pass
-            self._toolpath_ais = None
+            self._toolpath_g0_ais = None
+        if self._toolpath_g1_ais is not None:
             try:
-                ctx.UpdateCurrentViewer()
+                ctx.Remove(self._toolpath_g1_ais, False)
             except Exception:
                 pass
-        print("[NC] Cleared")
-
-    def toggle_toolpath(self, enabled: bool):
-        self._toolpath_visible = bool(enabled)
-        ctx = self._get_ctx()
-        if ctx is None or self._toolpath_ais is None:
-            return
-        if self._toolpath_visible:
-            try:
-                ctx.Display(self._toolpath_ais, False)
-            except Exception:
-                pass
-            print("[NC] Toolpath ON")
-        else:
-            try:
-                ctx.Erase(self._toolpath_ais, False)
-            except Exception:
-                pass
-            print("[NC] Toolpath OFF")
+            self._toolpath_g1_ais = None
+        self._clear_tool_vectors()
         try:
             ctx.UpdateCurrentViewer()
         except Exception:
             pass
+        print("[NC] Cleared")
+
+    def toggle_toolpath(self, enabled: bool):
+        self._toolpath_g0_visible = bool(enabled)
+        self._toolpath_g1_visible = bool(enabled)
+        self._apply_toolpath_visibility()
+        print("[NC] Toolpath ON" if enabled else "[NC] Toolpath OFF")
 
     def open_nc_program_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -2538,6 +2714,204 @@ class MainWindow(QMainWindow):
             self.load_nc_program(file_path)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load toolpath:\n{e}")
+
+    def _set_play_action_text(self, text: str):
+        if self._nc_play_action is not None:
+            self._nc_play_action.setText(text)
+        if self._nc_btn_play is not None:
+            self._nc_btn_play.setText(text)
+
+    def _compute_tool_dir(self, b_deg: float, c_deg: float) -> gp_Dir:
+        # Convention: base tool axis points along -Z when B=0, C=0.
+        vec = gp_Vec(0, 0, -1)
+        try:
+            vec.Rotate(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)), math.radians(b_deg))
+            vec.Rotate(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), math.radians(c_deg))
+            return gp_Dir(vec)
+        except Exception:
+            return gp_Dir(0, 0, -1)
+
+    def _clear_tool_vectors(self):
+        ctx = self._get_ctx()
+        if ctx is None:
+            self._tool_vec_current_ais = None
+            self._tool_vec_samples_ais = None
+            return
+        for ais in (self._tool_vec_current_ais, self._tool_vec_samples_ais):
+            if ais is None:
+                continue
+            try:
+                ctx.Remove(ais, False)
+            except Exception:
+                pass
+        self._tool_vec_current_ais = None
+        self._tool_vec_samples_ais = None
+
+    def _update_tool_vector_for_line(self, index: int):
+        if not self._show_tool_vectors:
+            return
+        if not self._nc_line_state or index < 0 or index >= len(self._nc_line_state):
+            return
+        state = self._nc_line_state[index]
+        pos = state.get("pos")
+        b_deg = float(state.get("b", 0.0))
+        c_deg = float(state.get("c", 0.0))
+        if not pos or len(pos) < 3:
+            return
+
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        try:
+            p_tip = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
+            d = self._compute_tool_dir(b_deg, c_deg)
+            vec = gp_Vec(d)
+            vec.Multiply(float(self._tool_length_mm))
+            p_shank = p_tip.Translated(vec)
+            edge = BRepBuilderAPI_MakeEdge(p_tip, p_shank).Edge()
+            ais = AIS_Shape(edge)
+            try:
+                ais.SetColor(Quantity_Color(0.2, 0.9, 0.2, Quantity_TOC_RGB))
+            except Exception:
+                pass
+            try:
+                ais.SetWidth(2.0)
+            except Exception:
+                pass
+            if self._tool_vec_current_ais is not None:
+                try:
+                    ctx.Remove(self._tool_vec_current_ais, False)
+                except Exception:
+                    pass
+            ctx.Display(ais, False)
+            try:
+                ctx.Deactivate(ais)
+            except Exception:
+                try:
+                    ctx.SetSelectable(ais, False)
+                except Exception:
+                    pass
+            self._tool_vec_current_ais = ais
+            ctx.UpdateCurrentViewer()
+            print(f"[VEC] Tool vector updated line {index + 1} B={b_deg} C={c_deg}")
+        except Exception:
+            pass
+
+    def _rebuild_tool_vector_samples(self):
+        self._clear_tool_vectors()
+        if not self._show_tool_vectors:
+            return
+        if not self._nc_line_state:
+            return
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        n = max(1, min(int(self._vector_sampling_n), 1000))
+        comp = TopoDS_Compound()
+        builder = BRep_Builder()
+        builder.MakeCompound(comp)
+        for i in range(0, len(self._nc_line_state), n):
+            state = self._nc_line_state[i]
+            pos = state.get("pos")
+            if not pos or len(pos) < 3:
+                continue
+            b_deg = float(state.get("b", 0.0))
+            c_deg = float(state.get("c", 0.0))
+            try:
+                p_tip = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
+                d = self._compute_tool_dir(b_deg, c_deg)
+                vec = gp_Vec(d)
+                vec.Multiply(float(self._tool_length_mm))
+                p_shank = p_tip.Translated(vec)
+                edge = BRepBuilderAPI_MakeEdge(p_tip, p_shank).Edge()
+                builder.Add(comp, edge)
+            except Exception:
+                continue
+        try:
+            ais = AIS_Shape(comp)
+            try:
+                ais.SetColor(Quantity_Color(0.2, 0.7, 0.8, Quantity_TOC_RGB))
+            except Exception:
+                pass
+            try:
+                ais.SetWidth(1.0)
+            except Exception:
+                pass
+            ctx.Display(ais, False)
+            try:
+                ctx.Deactivate(ais)
+            except Exception:
+                try:
+                    ctx.SetSelectable(ais, False)
+                except Exception:
+                    pass
+            self._tool_vec_samples_ais = ais
+            ctx.UpdateCurrentViewer()
+            print(f"[VEC] Sampling every {n} lines")
+        except Exception:
+            pass
+
+    def _toggle_show_tool_vectors(self, checked: bool):
+        self._show_tool_vectors = bool(checked)
+        if not self._show_tool_vectors:
+            self._clear_tool_vectors()
+            return
+        self._rebuild_tool_vector_samples()
+        self._update_tool_vector_for_line(self._nc_current_line)
+
+    def _open_machining_settings(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Machining Settings")
+        layout = QFormLayout(dialog)
+
+        spin_tool_dia = QDoubleSpinBox()
+        spin_tool_dia.setRange(0.1, 1000.0)
+        spin_tool_dia.setDecimals(3)
+        spin_tool_dia.setValue(float(self._tool_diameter_mm))
+        layout.addRow("Tool Diameter (mm):", spin_tool_dia)
+
+        spin_tool_len = QDoubleSpinBox()
+        spin_tool_len.setRange(0.1, 2000.0)
+        spin_tool_len.setDecimals(3)
+        spin_tool_len.setValue(float(self._tool_length_mm))
+        layout.addRow("Tool Length (mm):", spin_tool_len)
+
+        spin_speed = QSpinBox()
+        spin_speed.setRange(20, 1000)
+        spin_speed.setValue(int(self._nc_speed_ms))
+        layout.addRow("Speed (ms):", spin_speed)
+
+        spin_sampling = QSpinBox()
+        spin_sampling.setRange(1, 1000)
+        spin_sampling.setValue(int(self._vector_sampling_n))
+        layout.addRow("Vector sampling (every N lines):", spin_sampling)
+
+        chk_vectors = QCheckBox("Show tool vectors")
+        chk_vectors.setChecked(bool(self._show_tool_vectors))
+        layout.addRow(chk_vectors)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self._tool_diameter_mm = float(spin_tool_dia.value())
+        self._tool_length_mm = float(spin_tool_len.value())
+        self._vector_sampling_n = int(spin_sampling.value())
+        self._nc_speed_changed(int(spin_speed.value()))
+        self._show_tool_vectors = bool(chk_vectors.isChecked())
+        if self._show_vectors_action is not None:
+            self._show_vectors_action.setChecked(self._show_tool_vectors)
+
+        if self._show_tool_vectors:
+            self._rebuild_tool_vector_samples()
+            self._update_tool_vector_for_line(self._nc_current_line)
+        else:
+            self._clear_tool_vectors()
 
     def _schedule_hlr_rebuild(self):
         return
