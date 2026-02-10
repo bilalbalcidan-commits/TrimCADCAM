@@ -60,6 +60,7 @@ from OCC.Core.Prs3d import Prs3d_Drawer
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCC.Core.BRep import BRep_Builder
 from OCC.Core.TopoDS import TopoDS_Compound
+from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder
 
 from OCC.Core.Aspect import Aspect_TOL_SOLID, Aspect_TOTP_LEFT_LOWER
 from OCC.Core.V3d import V3d_ZBUFFER
@@ -411,8 +412,13 @@ class MainWindow(QMainWindow):
         self._show_tool_vectors = True
         self._tool_vec_current_ais = None
         self._tool_vec_samples_ais = None
-        self._axis_convention_key = "A"
-        self._invert_tool_axis = False
+        self._axis_convention_key = "C"
+        self._invert_vectors = False
+        self._invert_tool_body = True
+        self._invert_vec_user_set = False
+        self._invert_body_user_set = False
+        self._tool_body_ais = None
+        print("[VEC] Default convention set to C")
 
         self._last_click_shift = False
 
@@ -2459,6 +2465,7 @@ class MainWindow(QMainWindow):
 
         self._highlight_nc_line(idx)
         self._update_tool_vector_for_line(idx)
+        self._update_tool_body_for_line(idx)
         print(f"[NC] Line {idx + 1}/{len(self._nc_lines)} points={visible_count}/{total_points}")
 
     def _highlight_nc_line(self, index: int):
@@ -2715,6 +2722,7 @@ class MainWindow(QMainWindow):
                 pass
             self._toolpath_g1_ais = None
         self._clear_tool_vectors()
+        self._clear_tool_body()
         try:
             ctx.UpdateCurrentViewer()
         except Exception:
@@ -2761,8 +2769,9 @@ class MainWindow(QMainWindow):
         key, name, base, order = self._get_axis_convention()
         base_txt = f"({base[0]},{base[1]},{base[2]})"
         order_txt = " then ".join(f"{a}@{ax}" for a, ax in order)
-        invert_val = 1 if self._invert_tool_axis else 0
-        print(f"[VEC] Convention={key} base={base_txt} order={order_txt} invert={invert_val}")
+        inv_vec = 1 if self._invert_vectors else 0
+        inv_body = 1 if self._invert_tool_body else 0
+        print(f"[VEC] invert_vectors={inv_vec} invert_tool_body={inv_body} convention={key}")
 
     def _get_axis_convention(self):
         for key, name, base, order in self._axis_conventions():
@@ -2811,6 +2820,79 @@ class MainWindow(QMainWindow):
         self._tool_vec_current_ais = None
         self._tool_vec_samples_ais = None
 
+    def _clear_tool_body(self):
+        ctx = self._get_ctx()
+        if ctx is None:
+            self._tool_body_ais = None
+            return
+        if self._tool_body_ais is not None:
+            try:
+                ctx.Remove(self._tool_body_ais, False)
+            except Exception:
+                pass
+            self._tool_body_ais = None
+
+    def _update_tool_body_for_line(self, index: int):
+        if not self._nc_line_state or index < 0 or index >= len(self._nc_line_state):
+            self._clear_tool_body()
+            return
+        if self._tool_length_mm <= 0.0 or self._tool_diameter_mm <= 0.0:
+            self._clear_tool_body()
+            return
+        state = self._nc_line_state[index]
+        pos = state.get("pos")
+        b_deg = float(state.get("b", 0.0))
+        c_deg = float(state.get("c", 0.0))
+        if not pos or len(pos) < 3:
+            return
+
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        try:
+            p_tip = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
+            dir_vec = self._compute_tool_dir_vec(b_deg, c_deg)
+            if self._invert_tool_body:
+                dir_vec.Multiply(-1.0)
+            try:
+                dir_unit = gp_Dir(dir_vec)
+            except Exception:
+                dir_unit = gp_Dir(0, 0, -1)
+            base_vec = gp_Vec(dir_unit)
+            base_vec.Multiply(float(self._tool_length_mm))
+            p_base = p_tip.Translated(base_vec.Reversed())
+            ax2 = gp_Ax2(p_base, dir_unit)
+            radius = float(self._tool_diameter_mm) * 0.5
+            cyl = BRepPrimAPI_MakeCylinder(ax2, radius, float(self._tool_length_mm)).Shape()
+            ais = AIS_Shape(cyl)
+            try:
+                ais.SetColor(Quantity_Color(0.2, 0.9, 0.2, Quantity_TOC_RGB))
+            except Exception:
+                pass
+            try:
+                ais.SetTransparency(0.3)
+            except Exception:
+                pass
+            if self._tool_body_ais is not None:
+                try:
+                    ctx.Remove(self._tool_body_ais, False)
+                except Exception:
+                    pass
+            ctx.Display(ais, False)
+            try:
+                ctx.Deactivate(ais)
+            except Exception:
+                try:
+                    ctx.SetSelectable(ais, False)
+                except Exception:
+                    pass
+            self._tool_body_ais = ais
+            ctx.UpdateCurrentViewer()
+            print(f"[TOOL] Updated: dia={self._tool_diameter_mm} len={self._tool_length_mm} line={index + 1}")
+        except Exception:
+            pass
+
     def _update_tool_vector_for_line(self, index: int):
         if not self._show_tool_vectors:
             return
@@ -2830,7 +2912,7 @@ class MainWindow(QMainWindow):
         try:
             p_tip = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
             vec = self._compute_tool_dir_vec(b_deg, c_deg)
-            if self._invert_tool_axis:
+            if self._invert_vectors:
                 vec.Multiply(-1.0)
             vec.Multiply(float(self._tool_length_mm))
             p_shank = p_tip.Translated(vec)
@@ -2886,7 +2968,7 @@ class MainWindow(QMainWindow):
             try:
                 p_tip = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
                 vec = self._compute_tool_dir_vec(b_deg, c_deg)
-                if self._invert_tool_axis:
+                if self._invert_vectors:
                     vec.Multiply(-1.0)
                 vec.Multiply(float(self._tool_length_mm))
                 p_shank = p_tip.Translated(vec)
@@ -2940,9 +3022,13 @@ class MainWindow(QMainWindow):
         combo_conv.setCurrentIndex(current_idx)
         layout.addRow("Axis Convention:", combo_conv)
 
-        chk_invert = QCheckBox("Invert tool axis")
-        chk_invert.setChecked(bool(self._invert_tool_axis))
-        layout.addRow(chk_invert)
+        chk_invert_vec = QCheckBox("Invert vectors")
+        chk_invert_vec.setChecked(bool(self._invert_vectors))
+        layout.addRow(chk_invert_vec)
+
+        chk_invert_body = QCheckBox("Invert tool body")
+        chk_invert_body.setChecked(bool(self._invert_tool_body))
+        layout.addRow(chk_invert_body)
 
         spin_tool_dia = QDoubleSpinBox()
         spin_tool_dia.setRange(0.1, 1000.0)
@@ -2975,7 +3061,75 @@ class MainWindow(QMainWindow):
         buttons.rejected.connect(dialog.reject)
         layout.addRow(buttons)
 
+        prev_tool_dia = float(self._tool_diameter_mm)
+        prev_tool_len = float(self._tool_length_mm)
+        prev_conv = str(self._axis_convention_key)
+        prev_inv_vec = bool(self._invert_vectors)
+        prev_inv_body = bool(self._invert_tool_body)
+
+        def _apply_settings(dia, length, conv_key, inv_vec, inv_body):
+            self._tool_diameter_mm = float(dia)
+            self._tool_length_mm = float(length)
+            self._axis_convention_key = str(conv_key)
+            self._invert_vectors = bool(inv_vec)
+            self._invert_tool_body = bool(inv_body)
+            self._log_vec_convention()
+            if self._show_tool_vectors:
+                self._rebuild_tool_vector_samples()
+                self._update_tool_vector_for_line(self._nc_current_line)
+            self._update_tool_body_for_line(self._nc_current_line)
+
+        spin_tool_dia.valueChanged.connect(
+            lambda v: _apply_settings(
+                v,
+                spin_tool_len.value(),
+                combo_conv.currentData(),
+                chk_invert_vec.isChecked(),
+                chk_invert_body.isChecked(),
+            )
+        )
+        spin_tool_len.valueChanged.connect(
+            lambda v: _apply_settings(
+                spin_tool_dia.value(),
+                v,
+                combo_conv.currentData(),
+                chk_invert_vec.isChecked(),
+                chk_invert_body.isChecked(),
+            )
+        )
+        def _on_conv_changed():
+            conv = str(combo_conv.currentData())
+            inv_vec = chk_invert_vec.isChecked()
+            inv_body = chk_invert_body.isChecked()
+            if conv == "C":
+                if not self._invert_vec_user_set:
+                    inv_vec = False
+                    chk_invert_vec.setChecked(False)
+                if not self._invert_body_user_set:
+                    inv_body = True
+                    chk_invert_body.setChecked(True)
+            else:
+                if not self._invert_body_user_set:
+                    inv_body = False
+                    chk_invert_body.setChecked(False)
+            _apply_settings(spin_tool_dia.value(), spin_tool_len.value(), conv, inv_vec, inv_body)
+
+        combo_conv.currentIndexChanged.connect(lambda _: _on_conv_changed())
+        chk_invert_vec.toggled.connect(
+            lambda v: (
+                setattr(self, "_invert_vec_user_set", True),
+                _apply_settings(spin_tool_dia.value(), spin_tool_len.value(), combo_conv.currentData(), v, chk_invert_body.isChecked())
+            )
+        )
+        chk_invert_body.toggled.connect(
+            lambda v: (
+                setattr(self, "_invert_body_user_set", True),
+                _apply_settings(spin_tool_dia.value(), spin_tool_len.value(), combo_conv.currentData(), chk_invert_vec.isChecked(), v)
+            )
+        )
+
         if dialog.exec() != QDialog.Accepted:
+            _apply_settings(prev_tool_dia, prev_tool_len, prev_conv, prev_inv_vec, prev_inv_body)
             return
 
         self._tool_diameter_mm = float(spin_tool_dia.value())
@@ -2984,7 +3138,8 @@ class MainWindow(QMainWindow):
         self._nc_speed_changed(int(spin_speed.value()))
         self._show_tool_vectors = bool(chk_vectors.isChecked())
         self._axis_convention_key = str(combo_conv.currentData())
-        self._invert_tool_axis = bool(chk_invert.isChecked())
+        self._invert_vectors = bool(chk_invert_vec.isChecked())
+        self._invert_tool_body = bool(chk_invert_body.isChecked())
         if self._show_vectors_action is not None:
             self._show_vectors_action.setChecked(self._show_tool_vectors)
 
@@ -2994,6 +3149,7 @@ class MainWindow(QMainWindow):
             self._update_tool_vector_for_line(self._nc_current_line)
         else:
             self._clear_tool_vectors()
+        self._update_tool_body_for_line(self._nc_current_line)
 
     def _schedule_hlr_rebuild(self):
         return
