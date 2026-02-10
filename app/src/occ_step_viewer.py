@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QCheckBox,
     QDialogButtonBox,
+    QComboBox,
     QSpinBox,
     QSlider,
     QTreeWidget,
@@ -72,7 +73,7 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QToolButton, QGraphicsDropShadowEffect
 from PySide6.QtSvg import QSvgRenderer
 
-from OCC.Core.gp import gp_Dir, gp_Pnt, gp_Ax1, gp_Ax2, gp_Vec
+from OCC.Core.gp import gp_Dir, gp_Pnt, gp_Ax1, gp_Ax2, gp_Vec, gp_Trsf
 from OCC.Core.Geom import Geom_Axis2Placement
 import math
 
@@ -410,6 +411,8 @@ class MainWindow(QMainWindow):
         self._show_tool_vectors = True
         self._tool_vec_current_ais = None
         self._tool_vec_samples_ais = None
+        self._axis_convention_key = "A"
+        self._invert_tool_axis = False
 
         self._last_click_shift = False
 
@@ -513,7 +516,7 @@ class MainWindow(QMainWindow):
         close_program_action.triggered.connect(self.on_close_program)
         file_menu.addAction(close_program_action)
 
-        menubar.addMenu("CAD")
+        cad_menu = menubar.addMenu("CAD")
 
         machining_menu = menubar.addMenu("Machining Strategy")
         load_tp_action = QAction("Load NC Toolpath/Program", self)
@@ -548,22 +551,20 @@ class MainWindow(QMainWindow):
         act_settings.triggered.connect(self._open_machining_settings)
         machining_menu.addAction(act_settings)
 
-        # Toolbar
-        tb = QToolBar("Tools")
-        self.addToolBar(tb)
-
         self.act_start_poly = QAction("Start Polyline Select", self)
         self.act_start_poly.setCheckable(True)
         self.act_start_poly.triggered.connect(self.toggle_polyline_mode)
-        tb.addAction(self.act_start_poly)
+        cad_menu.addAction(self.act_start_poly)
 
         self.act_ok_poly = QAction("OK (Create Polyline)", self)
         self.act_ok_poly.triggered.connect(self.commit_polyline)
-        tb.addAction(self.act_ok_poly)
+        cad_menu.addAction(self.act_ok_poly)
 
         self.act_cancel_poly = QAction("Cancel Selection", self)
         self.act_cancel_poly.triggered.connect(self.cancel_polyline_selection)
-        tb.addAction(self.act_cancel_poly)
+        cad_menu.addAction(self.act_cancel_poly)
+
+        print("[UI] Polyline actions moved to CAD menu")
 
         self.viewer._display.View_Iso()
         self.viewer._display.FitAll()
@@ -2310,11 +2311,22 @@ class MainWindow(QMainWindow):
         self._nc_status_label = QLabel("Line: 0/0  Points: 0/0")
         layout.addWidget(self._nc_status_label)
 
-        self._nc_btn_load = None
-        self._nc_btn_play = None
-        self._nc_btn_stop = None
-        self._nc_btn_prev = None
-        self._nc_btn_next = None
+        controls = QHBoxLayout()
+        self._nc_btn_play = QPushButton("Play")
+        self._nc_btn_stop = QPushButton("Stop")
+        self._nc_btn_prev = QPushButton("Step -")
+        self._nc_btn_next = QPushButton("Step +")
+        controls.addWidget(self._nc_btn_play)
+        controls.addWidget(self._nc_btn_stop)
+        controls.addWidget(self._nc_btn_prev)
+        controls.addWidget(self._nc_btn_next)
+
+        controls.addWidget(QLabel("Speed (ms):"))
+        self._nc_speed_spin = QSpinBox()
+        self._nc_speed_spin.setRange(20, 1000)
+        self._nc_speed_spin.setValue(self._nc_speed_ms)
+        controls.addWidget(self._nc_speed_spin)
+        layout.addLayout(controls)
 
         self._nc_line_slider = QSlider(Qt.Horizontal)
         self._nc_line_slider.setRange(0, 0)
@@ -2327,7 +2339,13 @@ class MainWindow(QMainWindow):
         dock.setWidget(container)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self._nc_dock = dock
+        self._nc_btn_play.clicked.connect(self._nc_play_pause)
+        self._nc_btn_stop.clicked.connect(self._nc_stop)
+        self._nc_btn_prev.clicked.connect(self._nc_step_prev)
+        self._nc_btn_next.clicked.connect(self._nc_step_next)
+        self._nc_speed_spin.valueChanged.connect(self._nc_speed_changed)
         self._nc_line_slider.valueChanged.connect(self._nc_slider_changed)
+        print("[NC] Playback controls added to NC Program dock")
 
     def load_nc_program(self, file_path: str):
         try:
@@ -2405,6 +2423,7 @@ class MainWindow(QMainWindow):
         self._nc_line_slider.setRange(0, max(0, len(self._nc_lines) - 1))
         self._nc_line_slider.setValue(0)
         self._rebuild_tool_vector_samples()
+        self._log_vec_convention()
         self.set_nc_line(0, fitall=True)
         print(f"[NC] Loaded {len(points)} points from {Path(file_path).name}")
         print(f"[NC] Program loaded: {Path(file_path).name} lines={len(lines)} points={len(points)}")
@@ -2500,6 +2519,13 @@ class MainWindow(QMainWindow):
 
     def _nc_speed_changed(self, value: int):
         self._nc_speed_ms = int(value)
+        if self._nc_speed_spin is not None:
+            if self._nc_speed_spin.value() != self._nc_speed_ms:
+                self._nc_speed_spin.blockSignals(True)
+                try:
+                    self._nc_speed_spin.setValue(self._nc_speed_ms)
+                finally:
+                    self._nc_speed_spin.blockSignals(False)
         if self._nc_timer.isActive():
             self._nc_timer.start(self._nc_speed_ms)
 
@@ -2721,15 +2747,53 @@ class MainWindow(QMainWindow):
         if self._nc_btn_play is not None:
             self._nc_btn_play.setText(text)
 
-    def _compute_tool_dir(self, b_deg: float, c_deg: float) -> gp_Dir:
-        # Convention: base tool axis points along -Z when B=0, C=0.
-        vec = gp_Vec(0, 0, -1)
+    def _axis_conventions(self):
+        return [
+            ("A", "Base (0,0,-1), B@Y then C@Z", (0.0, 0.0, -1.0), [("B", "Y"), ("C", "Z")]),
+            ("B", "Base (0,0,-1), C@Z then B@Y", (0.0, 0.0, -1.0), [("C", "Z"), ("B", "Y")]),
+            ("C", "Base (0,0,+1), B@Y then C@Z", (0.0, 0.0, 1.0), [("B", "Y"), ("C", "Z")]),
+            ("D", "Base (0,0,+1), C@Z then B@Y", (0.0, 0.0, 1.0), [("C", "Z"), ("B", "Y")]),
+            ("E", "Base (0,0,-1), B@X then C@Z", (0.0, 0.0, -1.0), [("B", "X"), ("C", "Z")]),
+            ("F", "Base (0,0,-1), C@Z then B@X", (0.0, 0.0, -1.0), [("C", "Z"), ("B", "X")]),
+        ]
+
+    def _log_vec_convention(self):
+        key, name, base, order = self._get_axis_convention()
+        base_txt = f"({base[0]},{base[1]},{base[2]})"
+        order_txt = " then ".join(f"{a}@{ax}" for a, ax in order)
+        invert_val = 1 if self._invert_tool_axis else 0
+        print(f"[VEC] Convention={key} base={base_txt} order={order_txt} invert={invert_val}")
+
+    def _get_axis_convention(self):
+        for key, name, base, order in self._axis_conventions():
+            if key == self._axis_convention_key:
+                return key, name, base, order
+        return self._axis_conventions()[0]
+
+    def _axis_dir_from_letter(self, axis: str) -> gp_Dir:
+        if axis == "X":
+            return gp_Dir(1, 0, 0)
+        if axis == "Y":
+            return gp_Dir(0, 1, 0)
+        return gp_Dir(0, 0, 1)
+
+    def _compute_tool_dir_vec(self, b_deg: float, c_deg: float) -> gp_Vec:
+        # Convention: base tool axis + rotation order is user-selectable.
+        _, _, base, order = self._get_axis_convention()
+        vec = gp_Vec(base[0], base[1], base[2])
         try:
-            vec.Rotate(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)), math.radians(b_deg))
-            vec.Rotate(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), math.radians(c_deg))
-            return gp_Dir(vec)
+            for ang_code, axis in order:
+                angle_deg = b_deg if ang_code == "B" else c_deg
+                trsf = gp_Trsf()
+                trsf.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), self._axis_dir_from_letter(axis)), math.radians(angle_deg))
+                vec.Transform(trsf)
+            try:
+                vec.Normalize()
+            except Exception:
+                pass
+            return vec
         except Exception:
-            return gp_Dir(0, 0, -1)
+            return gp_Vec(0, 0, -1)
 
     def _clear_tool_vectors(self):
         ctx = self._get_ctx()
@@ -2765,8 +2829,9 @@ class MainWindow(QMainWindow):
 
         try:
             p_tip = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
-            d = self._compute_tool_dir(b_deg, c_deg)
-            vec = gp_Vec(d)
+            vec = self._compute_tool_dir_vec(b_deg, c_deg)
+            if self._invert_tool_axis:
+                vec.Multiply(-1.0)
             vec.Multiply(float(self._tool_length_mm))
             p_shank = p_tip.Translated(vec)
             edge = BRepBuilderAPI_MakeEdge(p_tip, p_shank).Edge()
@@ -2820,8 +2885,9 @@ class MainWindow(QMainWindow):
             c_deg = float(state.get("c", 0.0))
             try:
                 p_tip = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
-                d = self._compute_tool_dir(b_deg, c_deg)
-                vec = gp_Vec(d)
+                vec = self._compute_tool_dir_vec(b_deg, c_deg)
+                if self._invert_tool_axis:
+                    vec.Multiply(-1.0)
                 vec.Multiply(float(self._tool_length_mm))
                 p_shank = p_tip.Translated(vec)
                 edge = BRepBuilderAPI_MakeEdge(p_tip, p_shank).Edge()
@@ -2865,6 +2931,19 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("Machining Settings")
         layout = QFormLayout(dialog)
 
+        combo_conv = QComboBox()
+        current_idx = 0
+        for i, (key, name, base, order) in enumerate(self._axis_conventions()):
+            combo_conv.addItem(f"{key}) {name}", key)
+            if key == self._axis_convention_key:
+                current_idx = i
+        combo_conv.setCurrentIndex(current_idx)
+        layout.addRow("Axis Convention:", combo_conv)
+
+        chk_invert = QCheckBox("Invert tool axis")
+        chk_invert.setChecked(bool(self._invert_tool_axis))
+        layout.addRow(chk_invert)
+
         spin_tool_dia = QDoubleSpinBox()
         spin_tool_dia.setRange(0.1, 1000.0)
         spin_tool_dia.setDecimals(3)
@@ -2904,9 +2983,12 @@ class MainWindow(QMainWindow):
         self._vector_sampling_n = int(spin_sampling.value())
         self._nc_speed_changed(int(spin_speed.value()))
         self._show_tool_vectors = bool(chk_vectors.isChecked())
+        self._axis_convention_key = str(combo_conv.currentData())
+        self._invert_tool_axis = bool(chk_invert.isChecked())
         if self._show_vectors_action is not None:
             self._show_vectors_action.setChecked(self._show_tool_vectors)
 
+        self._log_vec_convention()
         if self._show_tool_vectors:
             self._rebuild_tool_vector_samples()
             self._update_tool_vector_for_line(self._nc_current_line)
