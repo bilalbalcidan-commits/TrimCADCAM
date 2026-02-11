@@ -1226,8 +1226,11 @@ class MainWindow(QMainWindow):
 
         self._tree_unhighlight()
 
-        col = Quantity_Color(1.0, 1.0, 0.0, Quantity_TOC_RGB) if kind == "MODEL" \
-            else Quantity_Color(0.2, 0.4, 1.0, Quantity_TOC_RGB)
+        col = (
+            Quantity_Color(1.0, 1.0, 0.0, Quantity_TOC_RGB)
+            if kind == "MODEL"
+            else Quantity_Color(0.8, 0.8, 0.8, Quantity_TOC_RGB)
+        )
 
         try:
             ctx.HilightWithColor(ais_obj, col, True)
@@ -3398,9 +3401,8 @@ class MainWindow(QMainWindow):
                     tip_world.Transform(trans)
                     line_txt = f"line={index + 1} " if index is not None else ""
                     print(
-                        f"[SIM] {line_txt}XYZ=({p_tip.X():.3f},{p_tip.Y():.3f},{p_tip.Z():.3f}) "
-                        f"A={a_deg:.3f} B={b_deg:.3f} C={c_deg:.3f} "
-                        f"tip_world=({tip_world.X():.3f},{tip_world.Y():.3f},{tip_world.Z():.3f})"
+                        f"[SIM] {line_txt}"
+                        f"XYZ=({p_tip.X():.3f}, {p_tip.Y():.3f}, {p_tip.Z():.3f})"
                     )
                 except Exception:
                     pass
