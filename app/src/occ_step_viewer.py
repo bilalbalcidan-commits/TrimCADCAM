@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 import re
 
-from PySide6.QtCore import Qt, QEvent, QTimer, QSettings
+from PySide6.QtCore import Qt, QEvent, QTimer, QSettings, QElapsedTimer
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -58,15 +58,17 @@ from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_SOLID
 from OCC.Core.TopoDS import topods
 
-from OCC.Core.AIS import AIS_Shape, AIS_Trihedron
+from OCC.Core.AIS import AIS_Shape, AIS_Trihedron, AIS_Point
 from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB, Quantity_NOC_YELLOW
-from OCC.Core.Prs3d import Prs3d_Drawer
+from OCC.Core.Prs3d import Prs3d_Drawer, Prs3d_LineAspect
 
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCC.Core.BRep import BRep_Builder
 from OCC.Core.TopoDS import TopoDS_Compound
 from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+from OCC.Core.Bnd import Bnd_Box
+from OCC.Core.BRepBndLib import brepbndlib_Add
 
 from OCC.Core.Aspect import Aspect_TOL_SOLID, Aspect_TOTP_LEFT_LOWER
 from OCC.Core.V3d import V3d_ZBUFFER
@@ -81,7 +83,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QToolButton, QGraphicsDropSh
 from PySide6.QtSvg import QSvgRenderer
 
 from OCC.Core.gp import gp_Dir, gp_Pnt, gp_Ax1, gp_Ax2, gp_Ax3, gp_Vec, gp_Trsf
-from OCC.Core.Geom import Geom_Axis2Placement
+from OCC.Core.Geom import Geom_Axis2Placement, Geom_CartesianPoint
 import math
 
 
@@ -425,6 +427,17 @@ class MainWindow(QMainWindow):
         self._invert_body_user_set = False
         self._tool_body_ais = None
         self._tool_body_dims = None
+        self._tool_tip_ais = None
+        self._tool_tip_local_z = None
+        self._tool_tip_zmin = None
+        self._tool_tip_zmax = None
+        self._tool_tip_sign_fixed = False
+        self._debug_sim_pose = False
+        self._sim_playing = False
+        self._sim_seg_index = 0
+        self._sim_t = 0.0
+        self._sim_last_ms = 0
+        self._sim_clock = QElapsedTimer()
         print("[VEC] Default convention set to C")
         self._mesh_quality = "Medium"
 
@@ -511,6 +524,58 @@ class MainWindow(QMainWindow):
                 pass
             try:
                 ctx.SetHighlightStyle(hl)
+            except Exception:
+                pass
+            try:
+                sel_drawer = Prs3d_Drawer()
+                dark_fill = Quantity_Color(0.25, 0.25, 0.25, Quantity_TOC_RGB)
+                edge_col = Quantity_Color(0.35, 0.35, 0.35, Quantity_TOC_RGB)
+
+                try:
+                    sel_drawer.SetDisplayMode(1)  # AIS_Shaded
+                except Exception:
+                    pass
+                try:
+                    sel_drawer.SetColor(dark_fill)
+                except Exception:
+                    pass
+                try:
+                    sel_drawer.SetTransparency(0.08)
+                except Exception:
+                    pass
+                try:
+                    shading = sel_drawer.ShadingAspect()
+                    try:
+                        shading.SetColor(dark_fill)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                try:
+                    sel_drawer.UIsoAspect().SetNumber(0)
+                except Exception:
+                    pass
+                try:
+                    sel_drawer.VIsoAspect().SetNumber(0)
+                except Exception:
+                    pass
+
+                try:
+                    sel_drawer.SetFaceBoundaryDraw(True)
+                except Exception:
+                    pass
+                try:
+                    sel_drawer.SetFaceBoundaryAspect(
+                        Prs3d_LineAspect(edge_col, Aspect_TOL_SOLID, 2.0)
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    ctx.SetSelectionStyle(sel_drawer)
+                except Exception:
+                    pass
             except Exception:
                 pass
             try:
@@ -2670,10 +2735,10 @@ class MainWindow(QMainWindow):
         print(f"[NC] Loaded {len(points)} points from {Path(file_path).name}")
         print(f"[NC] Program loaded: {Path(file_path).name} lines={len(lines)} points={len(points)}")
 
-    def set_nc_line(self, index: int, fitall: bool = False):
+    def set_nc_line(self, index: int, fitall: bool = False, update_tool: bool = True, keep_tool: bool = False):
         if not self._nc_lines:
             self._nc_status_label.setText("Line: 0/0  Points: 0/0")
-            self.clear_toolpath()
+            self.clear_toolpath(keep_tool=keep_tool, update_viewer=not keep_tool)
             return
 
         idx = max(0, min(int(index), len(self._nc_lines) - 1))
@@ -2695,14 +2760,15 @@ class MainWindow(QMainWindow):
         g0_segments = [(p1, p2) for p1, p2, li in self._nc_segments_g0 if li <= idx]
         g1_segments = [(p1, p2) for p1, p2, li in self._nc_segments_g1 if li <= idx]
         if g0_segments or g1_segments:
-            self.load_toolpath_segments(g0_segments, g1_segments, fitall=fitall)
+            self.load_toolpath_segments(g0_segments, g1_segments, fitall=fitall, keep_tool=keep_tool)
         else:
-            self.clear_toolpath()
+            self.clear_toolpath(keep_tool=keep_tool, update_viewer=not keep_tool)
 
         self._highlight_nc_line(idx)
-        self._update_tool_vector_for_line(idx)
-        self._update_tool_body_for_line(idx)
-        print(f"[NC] Line {idx + 1}/{len(self._nc_lines)} points={visible_count}/{total_points}")
+        if update_tool:
+            self._update_tool_vector_for_line(idx)
+            self._update_tool_body_for_line(idx)
+            print(f"[NC] Line {idx + 1}/{len(self._nc_lines)} points={visible_count}/{total_points}")
 
     def _highlight_nc_line(self, index: int):
         if not self._nc_lines:
@@ -2730,13 +2796,24 @@ class MainWindow(QMainWindow):
             return
         if self._nc_timer.isActive():
             self._nc_timer.stop()
+            self._sim_playing = False
             self._set_play_action_text("Play")
         else:
+            self._sim_playing = True
+            self._sim_seg_index = int(self._nc_current_line)
+            self._sim_t = 0.0
+            try:
+                self._sim_clock.restart()
+                self._sim_last_ms = 0
+            except Exception:
+                self._sim_last_ms = 0
             self._nc_timer.start(self._nc_speed_ms)
             self._set_play_action_text("Pause")
 
     def _nc_stop(self):
         self._nc_timer.stop()
+        self._sim_playing = False
+        self._sim_t = 0.0
         self._set_play_action_text("Play")
         self.set_nc_line(0, fitall=False)
 
@@ -2754,11 +2831,36 @@ class MainWindow(QMainWindow):
         if not self._nc_lines:
             self._nc_timer.stop()
             return
-        if self._nc_current_line >= len(self._nc_lines) - 1:
+        if self._sim_seg_index >= len(self._nc_lines) - 1:
             self._nc_timer.stop()
+            self._sim_playing = False
             self._set_play_action_text("Play")
             return
-        self.set_nc_line(self._nc_current_line + 1, fitall=False)
+
+        now_ms = 0
+        try:
+            now_ms = int(self._sim_clock.elapsed())
+        except Exception:
+            now_ms = 0
+        dt_ms = max(1, now_ms - int(self._sim_last_ms))
+        self._sim_last_ms = now_ms
+
+        seg_ms = max(1, int(self._nc_speed_ms))
+        self._sim_t += float(dt_ms) / float(seg_ms)
+
+        while self._sim_t >= 1.0 and self._sim_seg_index < len(self._nc_lines) - 1:
+            self._sim_t -= 1.0
+            self._sim_seg_index += 1
+            self.set_nc_line(self._sim_seg_index, fitall=False, update_tool=False, keep_tool=True)
+
+        if self._sim_seg_index >= len(self._nc_lines) - 1:
+            self._nc_timer.stop()
+            self._sim_playing = False
+            self._set_play_action_text("Play")
+            return
+
+        pos, a_deg, b_deg, c_deg = self._interp_nc_pose(self._sim_seg_index, self._sim_t)
+        self._update_tool_body_for_pose(pos, a_deg, b_deg, c_deg, index=self._sim_seg_index)
 
     def _nc_speed_changed(self, value: int):
         self._nc_speed_ms = int(value)
@@ -2824,7 +2926,7 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
-    def _apply_toolpath_visibility(self):
+    def _apply_toolpath_visibility(self, update_viewer: bool = True):
         ctx = self._get_ctx()
         if ctx is None:
             return
@@ -2844,22 +2946,23 @@ class MainWindow(QMainWindow):
                     ctx.Erase(self._toolpath_g1_ais, False)
             except Exception:
                 pass
-        try:
-            ctx.UpdateCurrentViewer()
-        except Exception:
-            pass
+        if update_viewer:
+            try:
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
 
-    def load_toolpath_segments(self, g0_segments, g1_segments, fitall: bool = True):
+    def load_toolpath_segments(self, g0_segments, g1_segments, fitall: bool = True, keep_tool: bool = False):
         ctx = self._get_ctx()
         if ctx is None:
             return
-        self.clear_toolpath()
+        self.clear_toolpath(keep_tool=keep_tool, update_viewer=not keep_tool)
 
         g0_color = Quantity_Color(0.7, 0.7, 0.7, Quantity_TOC_RGB)
         g1_color = Quantity_NOC_YELLOW
         self._toolpath_g0_ais = self._build_toolpath_ais(g0_segments, g0_color, 1.2)
         self._toolpath_g1_ais = self._build_toolpath_ais(g1_segments, g1_color, 2.5)
-        self._apply_toolpath_visibility()
+        self._apply_toolpath_visibility(update_viewer=not keep_tool)
 
         if fitall:
             try:
@@ -2939,7 +3042,7 @@ class MainWindow(QMainWindow):
         self.load_toolpath_points(points, fitall=True)
         print(f"[NC] Loaded {len(points)} points from {Path(file_path).name}")
 
-    def clear_toolpath(self):
+    def clear_toolpath(self, keep_tool: bool = False, update_viewer: bool = True):
         ctx = self._get_ctx()
         if ctx is None:
             self._toolpath_g0_ais = None
@@ -2957,12 +3060,14 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._toolpath_g1_ais = None
-        self._clear_tool_vectors()
-        self._clear_tool_body()
-        try:
-            ctx.UpdateCurrentViewer()
-        except Exception:
-            pass
+        if not keep_tool:
+            self._clear_tool_vectors()
+            self._clear_tool_body()
+        if update_viewer:
+            try:
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
         print("[NC] Cleared")
 
     def toggle_toolpath(self, enabled: bool):
@@ -3061,6 +3166,11 @@ class MainWindow(QMainWindow):
         if ctx is None:
             self._tool_body_ais = None
             self._tool_body_dims = None
+            self._tool_tip_ais = None
+            self._tool_tip_local_z = None
+            self._tool_tip_zmin = None
+            self._tool_tip_zmax = None
+            self._tool_tip_sign_fixed = False
             return
         if self._tool_body_ais is not None:
             try:
@@ -3069,12 +3179,133 @@ class MainWindow(QMainWindow):
                 pass
             self._tool_body_ais = None
             self._tool_body_dims = None
+        if self._tool_tip_ais is not None:
+            try:
+                ctx.Remove(self._tool_tip_ais, False)
+            except Exception:
+                pass
+            self._tool_tip_ais = None
+            self._tool_tip_local_z = None
+        self._tool_tip_zmin = None
+        self._tool_tip_zmax = None
+        self._tool_tip_sign_fixed = False
+
+    def _ensure_tool_body_ais(self, radius: float, length: float):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        dims = (float(radius), float(length))
+        if self._tool_body_ais is not None:
+            self._tool_body_dims = dims
+            return
+
+        cyl = BRepPrimAPI_MakeCylinder(radius, length).Shape()
+        try:
+            bbox = Bnd_Box()
+            brepbndlib_Add(cyl, bbox)
+            xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+            self._tool_tip_zmin = float(zmin)
+            self._tool_tip_zmax = float(zmax)
+            self._tool_tip_local_z = float(zmax)
+            self._tool_tip_sign_fixed = False
+        except Exception:
+            self._tool_tip_zmin = None
+            self._tool_tip_zmax = None
+            self._tool_tip_local_z = float(length)
+            self._tool_tip_sign_fixed = False
+        ais = AIS_Shape(cyl)
+        try:
+            ais.SetColor(Quantity_Color(0.2, 0.9, 0.2, Quantity_TOC_RGB))
+        except Exception:
+            pass
+        try:
+            ais.SetTransparency(0.3)
+        except Exception:
+            pass
+        ctx.Display(ais, False)
+        try:
+            ctx.Deactivate(ais)
+        except Exception:
+            try:
+                ctx.SetSelectable(ais, False)
+            except Exception:
+                pass
+        self._tool_body_ais = ais
+        self._tool_body_dims = dims
+
+    def _ensure_tool_tip_marker(self, tip_local_z: float):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+
+        tip_local_z = float(tip_local_z)
+        if self._tool_tip_ais is not None:
+            if self._tool_tip_local_z == tip_local_z:
+                return
+            try:
+                ctx.Remove(self._tool_tip_ais, False)
+            except Exception:
+                pass
+            self._tool_tip_ais = None
+            self._tool_tip_local_z = None
+
+        try:
+            geom_p = Geom_CartesianPoint(0.0, 0.0, tip_local_z)
+            ais_p = AIS_Point(geom_p)
+        except Exception:
+            return
+
+        try:
+            ais_p.SetColor(Quantity_Color(1.0, 0.2, 0.2, Quantity_TOC_RGB))
+        except Exception:
+            pass
+        try:
+            ais_p.SetWidth(4.0)
+        except Exception:
+            pass
+
+        ctx.Display(ais_p, False)
+        try:
+            ctx.Deactivate(ais_p)
+        except Exception:
+            try:
+                ctx.SetSelectable(ais_p, False)
+            except Exception:
+                pass
+
+        self._tool_tip_ais = ais_p
+        self._tool_tip_local_z = tip_local_z
+
+    def _interp_nc_pose(self, index: int, t: float):
+        if not self._nc_line_state:
+            return (0.0, 0.0, 0.0), 0.0, 0.0, 0.0
+        i0 = max(0, min(int(index), len(self._nc_line_state) - 1))
+        i1 = min(i0 + 1, len(self._nc_line_state) - 1)
+        s0 = self._nc_line_state[i0]
+        s1 = self._nc_line_state[i1]
+        t = max(0.0, min(float(t), 1.0))
+
+        p0 = s0.get("pos") or (0.0, 0.0, 0.0)
+        p1 = s1.get("pos") or p0
+        x = float(p0[0]) + (float(p1[0]) - float(p0[0])) * t
+        y = float(p0[1]) + (float(p1[1]) - float(p0[1])) * t
+        z = float(p0[2]) + (float(p1[2]) - float(p0[2])) * t
+
+        a0 = float(s0.get("a", 0.0))
+        b0 = float(s0.get("b", 0.0))
+        c0 = float(s0.get("c", 0.0))
+        a1 = float(s1.get("a", a0))
+        b1 = float(s1.get("b", b0))
+        c1 = float(s1.get("c", c0))
+
+        a = a0 + (a1 - a0) * t
+        b = b0 + (b1 - b0) * t
+        c = c0 + (c1 - c0) * t
+        return (x, y, z), a, b, c
 
     def _update_tool_body_for_line(self, index: int):
         if not self._nc_line_state or index < 0 or index >= len(self._nc_line_state):
-            self._clear_tool_body()
-            return
-        if self._tool_length_mm <= 0.0 or self._tool_diameter_mm <= 0.0:
             self._clear_tool_body()
             return
         state = self._nc_line_state[index]
@@ -3082,6 +3313,12 @@ class MainWindow(QMainWindow):
         a_deg = float(state.get("a", 0.0))
         b_deg = float(state.get("b", 0.0))
         c_deg = float(state.get("c", 0.0))
+        self._update_tool_body_for_pose(pos, a_deg, b_deg, c_deg, index=index)
+
+    def _update_tool_body_for_pose(self, pos, a_deg: float, b_deg: float, c_deg: float, index: int | None = None):
+        if self._tool_length_mm <= 0.0 or self._tool_diameter_mm <= 0.0:
+            self._clear_tool_body()
+            return
         if not pos or len(pos) < 3:
             return
 
@@ -3091,68 +3328,84 @@ class MainWindow(QMainWindow):
 
         try:
             p_tip = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
-            dir_vec = self._compute_tool_dir_vec(b_deg, c_deg)
-            if self._invert_tool_body:
-                dir_vec.Multiply(-1.0)
-            try:
-                dir_unit = gp_Dir(dir_vec)
-            except Exception:
-                dir_unit = gp_Dir(0, 0, -1)
             length = float(self._tool_length_mm)
             radius = float(self._tool_diameter_mm) * 0.5
 
-            if self._tool_body_ais is None or self._tool_body_dims != (radius, length):
-                cyl = BRepPrimAPI_MakeCylinder(radius, length).Shape()
-                ais = AIS_Shape(cyl)
-                try:
-                    ais.SetColor(Quantity_Color(0.2, 0.9, 0.2, Quantity_TOC_RGB))
-                except Exception:
-                    pass
-                try:
-                    ais.SetTransparency(0.3)
-                except Exception:
-                    pass
-                if self._tool_body_ais is not None:
-                    try:
-                        ctx.Remove(self._tool_body_ais, False)
-                    except Exception:
-                        pass
-                ctx.Display(ais, False)
-                try:
-                    ctx.Deactivate(ais)
-                except Exception:
-                    try:
-                        ctx.SetSelectable(ais, False)
-                    except Exception:
-                        pass
-                self._tool_body_ais = ais
-                self._tool_body_dims = (radius, length)
+            self._ensure_tool_body_ais(radius, length)
 
             ax_x = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0))
             ax_y = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0))
             ax_z = gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))
 
-            trsf = gp_Trsf()
-            trsf.SetRotation(ax_z, math.radians(c_deg))
-            trsf_b = gp_Trsf()
-            trsf_b.SetRotation(ax_y, math.radians(b_deg))
-            trsf.Multiply(trsf_b)
-            trsf_a = gp_Trsf()
-            trsf_a.SetRotation(ax_x, math.radians(a_deg))
-            trsf.Multiply(trsf_a)
+            rot = gp_Trsf()
+            rot.SetRotation(ax_z, math.radians(c_deg))
+            rot_b = gp_Trsf()
+            rot_b.SetRotation(ax_y, math.radians(b_deg))
+            rot.Multiply(rot_b)
+            rot_a = gp_Trsf()
+            rot_a.SetRotation(ax_x, math.radians(a_deg))
+            rot.Multiply(rot_a)
 
-            tip_vec = gp_Vec(0, 0, length)
-            tip_vec.Transform(trsf)
+            v_axis_world = self._compute_tool_dir_vec(b_deg, c_deg)
+            if self._invert_vectors:
+                v_axis_world.Multiply(-1.0)
+
+            tip_local_z = self._tool_tip_local_z if self._tool_tip_local_z is not None else length
+
+            if (
+                not self._tool_tip_sign_fixed
+                and self._tool_tip_zmin is not None
+                and self._tool_tip_zmax is not None
+            ):
+                try:
+                    zmin = float(self._tool_tip_zmin)
+                    zmax = float(self._tool_tip_zmax)
+
+                    def _body_dot_for_tip(tip_z: float) -> float:
+                        other_z = zmax if tip_z == zmin else zmin
+                        body_vec = gp_Vec(0.0, 0.0, other_z - tip_z)
+                        body_vec.Transform(rot)
+                        return body_vec.Dot(v_axis_world)
+
+                    dot_min = _body_dot_for_tip(zmin)
+                    dot_max = _body_dot_for_tip(zmax)
+                    desired_tip_z = zmin if dot_min >= dot_max else zmax
+
+                    if float(desired_tip_z) != float(tip_local_z):
+                        tip_local_z = float(desired_tip_z)
+                        self._tool_tip_local_z = float(desired_tip_z)
+                    self._tool_tip_sign_fixed = True
+                except Exception:
+                    pass
+
+            self._ensure_tool_tip_marker(tip_local_z)
+
+            tip_vec = gp_Vec(0, 0, tip_local_z)
+            tip_vec.Transform(rot)
             trans = gp_Trsf()
             trans.SetTranslation(gp_Vec(p_tip.X() - tip_vec.X(), p_tip.Y() - tip_vec.Y(), p_tip.Z() - tip_vec.Z()))
-            trans.Multiply(trsf)
-            self._tool_body_ais.SetLocalTransformation(trans)
-            try:
-                ctx.Redisplay(self._tool_body_ais, False)
-            except Exception:
-                pass
+            trans.Multiply(rot)
+
+            if self._tool_body_ais is not None:
+                self._tool_body_ais.SetLocalTransformation(trans)
+
+            if self._tool_tip_ais is not None:
+                self._tool_tip_ais.SetLocalTransformation(trans)
+
+            if self._debug_sim_pose:
+                try:
+                    tip_world = gp_Pnt(0.0, 0.0, tip_local_z)
+                    tip_world.Transform(trans)
+                    line_txt = f"line={index + 1} " if index is not None else ""
+                    print(
+                        f"[SIM] {line_txt}XYZ=({p_tip.X():.3f},{p_tip.Y():.3f},{p_tip.Z():.3f}) "
+                        f"A={a_deg:.3f} B={b_deg:.3f} C={c_deg:.3f} "
+                        f"tip_world=({tip_world.X():.3f},{tip_world.Y():.3f},{tip_world.Z():.3f})"
+                    )
+                except Exception:
+                    pass
+
             ctx.UpdateCurrentViewer()
-            print(f"[TOOL] Updated: dia={self._tool_diameter_mm} len={self._tool_length_mm} line={index + 1}")
         except Exception:
             pass
 
@@ -3331,11 +3584,24 @@ class MainWindow(QMainWindow):
         prev_inv_body = bool(self._invert_tool_body)
 
         def _apply_settings(dia, length, conv_key, inv_vec, inv_body):
-            self._tool_diameter_mm = float(dia)
-            self._tool_length_mm = float(length)
-            self._axis_convention_key = str(conv_key)
-            self._invert_vectors = bool(inv_vec)
-            self._invert_tool_body = bool(inv_body)
+            new_dia = float(dia)
+            new_len = float(length)
+            new_conv = str(conv_key)
+            new_inv_vec = bool(inv_vec)
+            new_inv_body = bool(inv_body)
+
+            if (
+                new_dia != float(self._tool_diameter_mm)
+                or new_len != float(self._tool_length_mm)
+                or new_inv_body != bool(self._invert_tool_body)
+            ):
+                self._clear_tool_body()
+
+            self._tool_diameter_mm = new_dia
+            self._tool_length_mm = new_len
+            self._axis_convention_key = new_conv
+            self._invert_vectors = new_inv_vec
+            self._invert_tool_body = new_inv_body
             self._log_vec_convention()
             if self._show_tool_vectors:
                 self._rebuild_tool_vector_samples()
