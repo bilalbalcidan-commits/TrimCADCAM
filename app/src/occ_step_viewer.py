@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 import re
 
-from PySide6.QtCore import Qt, QEvent, QTimer, QSettings, QElapsedTimer
+from PySide6.QtCore import Qt, QEvent, QTimer, QSettings, QElapsedTimer, QTime
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -55,22 +55,24 @@ from OCC.Core.STEPControl import STEPControl_Reader, STEPControl_Writer, STEPCon
 from OCC.Core.IFSelect import IFSelect_RetDone
 
 from OCC.Core.TopExp import TopExp_Explorer
-from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_SOLID
+from OCC.Core.TopAbs import TopAbs_EDGE, TopAbs_SOLID, TopAbs_VERTEX
 from OCC.Core.TopoDS import topods
 
-from OCC.Core.AIS import AIS_Shape, AIS_Trihedron, AIS_Point
+from OCC.Core.AIS import AIS_Shape, AIS_Trihedron, AIS_Point, AIS_Shaded, AIS_TextLabel
 from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB, Quantity_NOC_YELLOW
-from OCC.Core.Prs3d import Prs3d_Drawer, Prs3d_LineAspect
+from OCC.Core.Prs3d import Prs3d_Drawer, Prs3d_LineAspect, Prs3d_PointAspect
 
 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+from OCC.Core.BRep import BRep_Tool
 from OCC.Core.BRep import BRep_Builder
 from OCC.Core.TopoDS import TopoDS_Compound
-from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder, BRepPrimAPI_MakeSphere
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib_Add
 
-from OCC.Core.Aspect import Aspect_TOL_SOLID, Aspect_TOTP_LEFT_LOWER
+from OCC.Core.Aspect import Aspect_TOL_SOLID, Aspect_TOTP_LEFT_LOWER, Aspect_TOM_PLUS
+from OCC.Core.Graphic3d import Graphic3d_ZLayerId_Top
 from OCC.Core.V3d import V3d_ZBUFFER
 
 # ============================================================
@@ -83,7 +85,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QToolButton, QGraphicsDropSh
 from PySide6.QtSvg import QSvgRenderer
 
 from OCC.Core.gp import gp_Dir, gp_Pnt, gp_Ax1, gp_Ax2, gp_Ax3, gp_Vec, gp_Trsf
-from OCC.Core.Geom import Geom_Axis2Placement, Geom_CartesianPoint
+from OCC.Core.Geom import Geom_Axis2Placement, Geom_CartesianPoint, Geom_Point
 import math
 
 
@@ -413,6 +415,16 @@ class MainWindow(QMainWindow):
         self._polyline_counter = 0
         self._polylines = {}
         self._assembly_parts = []
+        self._toolpath_point_select_mode = False
+        self._toolpath_points = []
+        self._toolpath_points_is_nc = False
+        self._selected_points = {}
+        self._selected_points_counter = 0
+        self._toolpath_points_parent_item = None
+        self._toolpath_pick_ais = []
+        self._debug_pick = False
+        self._nc_pick_points_ais = []
+        self._ais_to_point_index = {}
 
         self._tool_diameter_mm = 10.0
         self._tool_length_mm = 100.0
@@ -442,6 +454,10 @@ class MainWindow(QMainWindow):
         self._mesh_quality = "Medium"
 
         self._last_click_shift = False
+        self._is_rmb_rotating = False
+        self._rmb_last_xy = None
+        self._rmb_pivot = None
+        self._last_rot_start_ts = 0
 
         # Selected edges overlay (persistent)
         self._selected_ais = {}
@@ -668,6 +684,12 @@ class MainWindow(QMainWindow):
         act_settings.triggered.connect(self._open_machining_settings)
         machining_menu.addAction(act_settings)
 
+        toolpath_menu = menubar.addMenu("Toolpath")
+        self._act_select_toolpath_points = QAction("Select Toolpath Points", self)
+        self._act_select_toolpath_points.setCheckable(True)
+        self._act_select_toolpath_points.triggered.connect(self._toggle_toolpath_point_select_mode)
+        toolpath_menu.addAction(self._act_select_toolpath_points)
+
         view_menu = menubar.addMenu("View")
         mesh_menu = view_menu.addMenu("Mesh Quality")
         mesh_group = QActionGroup(self)
@@ -705,6 +727,18 @@ class MainWindow(QMainWindow):
 
         # ✅ DO NOT swallow clicks: let viewer update its detection/selection state
         self.viewer.installEventFilter(self)
+        try:
+            vp = self.viewer.viewport() if hasattr(self.viewer, "viewport") else None
+            if vp is not None:
+                vp.installEventFilter(self)
+        except Exception:
+            pass
+        try:
+            inner = getattr(self.viewer, "_qt_widget", None)
+            if inner is not None:
+                inner.installEventFilter(self)
+        except Exception:
+            pass
 
         # --- View toolbar (bottom-right overlay) ---
         try:
@@ -884,11 +918,79 @@ class MainWindow(QMainWindow):
         dy = h - dy
         return dx, dy
 
-    def _zoom_at_cursor(self, event) -> bool:
+    def _qt_pos_to_occ_xy(self, event_or_pos, src_widget=None) -> tuple[int, int] | None:
+        """
+        Convert Qt mouse position to OCC (x,y) in VIEWPORT pixel coords.
+        Critical: use viewport-local coordinates. If event arrives from a child widget,
+        map it into viewport.
+        """
+        vp = None
+        try:
+            vp = self.viewer.viewport() if hasattr(self.viewer, "viewport") else None
+        except Exception:
+            vp = None
+        if vp is None:
+            vp = self.viewer
+
+        # ---- extract Qt local position (preferred: already local to src widget) ----
+        qx = qy = None
+        try:
+            p = event_or_pos.position()  # QMouseEvent (Qt6)
+            qx, qy = float(p.x()), float(p.y())
+        except Exception:
+            try:
+                p = event_or_pos.pos()     # Qt5-style
+                qx, qy = float(p.x()), float(p.y())
+            except Exception:
+                try:
+                    qx, qy = float(event_or_pos.x()), float(event_or_pos.y())
+                except Exception:
+                    return None
+
+        # If event came from a widget other than viewport, map into viewport coords
+        try:
+            if src_widget is not None and src_widget is not vp:
+                from PySide6.QtCore import QPoint
+                mapped = src_widget.mapTo(vp, QPoint(int(qx), int(qy)))
+                qx, qy = float(mapped.x()), float(mapped.y())
+        except Exception:
+            pass
+
+        dpr = 1.0
+        try:
+            dpr = float(vp.devicePixelRatioF())
+        except Exception:
+            try:
+                dpr = float(self.viewer.devicePixelRatioF())
+            except Exception:
+                pass
+
+        vw = int(vp.width())
+        vh = int(vp.height())
+
+        # clamp to viewport (prevents negative / outside coords)
+        if qx < 0:
+            qx = 0
+        if qy < 0:
+            qy = 0
+        if qx > vw - 1:
+            qx = vw - 1
+        if qy > vh - 1:
+            qy = vh - 1
+
+        # OCC MoveTo expects window coords with origin at TOP-LEFT (same as Qt).
+        # Do NOT flip Y here.
+        occ_x = int(qx * dpr)
+        occ_y = int(qy * dpr)
+        if self._toolpath_point_select_mode:
+            print(f"[PTS] qt=({qx:.2f},{qy:.2f}) occ=({occ_x},{occ_y}) view=({int(vw*dpr)},{int(vh*dpr)}) dpr={dpr:.2f}")
+        return occ_x, occ_y
+
+    def _zoom_to_cursor(self, event) -> bool:
         view = self._get_occ_view()
         if view is None:
             return False
-        xy = self._qt_to_occ_xy(event)
+        xy = self._qt_pos_to_occ_xy(event)
         if xy is None:
             return False
         try:
@@ -898,59 +1000,133 @@ class MainWindow(QMainWindow):
         if delta == 0:
             return False
         x, y = xy
-        factor = 0.9 if delta > 0 else 1.1
-        try:
-            if hasattr(view, "StartZoomAtPoint") and hasattr(view, "ZoomAtPoint"):
-                view.StartZoomAtPoint(x, y)
-                view.ZoomAtPoint(x, y, factor)
-            elif hasattr(view, "ZoomAtPoint"):
-                view.ZoomAtPoint(x, y, factor)
-            elif hasattr(view, "Zoom"):
-                step = 40
-                if delta > 0:
-                    view.Zoom(x - step, y - step, x + step, y + step)
-                else:
-                    view.Zoom(x + step, y + step, x - step, y - step)
-            else:
-                return False
+        zoom_step = 40
+        drift_mm = -1.0
+
+        def _convert_with_proj(mx, my):
             try:
-                view.Redraw()
+                return view.ConvertWithProj(mx, my)
             except Exception:
+                return None
+
+        def _get_ray_plane_point(mx, my):
+            try:
+                eye = view.Eye()
+                at = view.At()
+            except Exception:
+                return None
+            try:
+                n = gp_Vec(eye, at)
+                n.Normalize()
+            except Exception:
+                return None
+
+            conv = _convert_with_proj(mx, my)
+            if conv is not None:
                 try:
-                    self.viewer._display.Repaint()
+                    xw, yw, zw, dx, dy, dz = conv
                 except Exception:
-                    pass
-            return True
-        except Exception:
-            pass
+                    try:
+                        xw, yw, zw, dx, dy, dz = conv[0], conv[1], conv[2], conv[3], conv[4], conv[5]
+                    except Exception:
+                        return None
+                origin = gp_Pnt(float(xw), float(yw), float(zw))
+                try:
+                    dir_vec = gp_Vec(float(dx), float(dy), float(dz))
+                    dir_vec.Normalize()
+                except Exception:
+                    return None
+            else:
+                try:
+                    wp = view.Convert(mx, my)
+                except Exception:
+                    try:
+                        px, py, pz = view.Convert(mx, my, 0.0)
+                        wp = gp_Pnt(px, py, pz)
+                    except Exception:
+                        return None
+                origin = eye
+                try:
+                    dir_vec = gp_Vec(origin, wp)
+                    dir_vec.Normalize()
+                except Exception:
+                    return None
+
+            denom = n.Dot(dir_vec)
+            if abs(denom) < 1e-9:
+                return None
+            try:
+                v = gp_Vec(origin, at)
+                t = v.Dot(n) / denom
+            except Exception:
+                return None
+            try:
+                return gp_Pnt(
+                    origin.X() + dir_vec.X() * t,
+                    origin.Y() + dir_vec.Y() * t,
+                    origin.Z() + dir_vec.Z() * t,
+                )
+            except Exception:
+                return None
+
+        p_before = _get_ray_plane_point(x, y)
 
         try:
-            # Fallback: keep world point under cursor by pan correction.
-            before = view.Convert(x, y)
+            if hasattr(view, "StartZoomAtPoint"):
+                view.StartZoomAtPoint(x, y)
             if hasattr(view, "Zoom"):
-                step = 40
                 if delta > 0:
-                    view.Zoom(x - step, y - step, x + step, y + step)
+                    view.Zoom(x - zoom_step, y - zoom_step, x + zoom_step, y + zoom_step)
                 else:
-                    view.Zoom(x + step, y + step, x - step, y - step)
-            after = view.Convert(x, y)
-            try:
-                dx = before.X() - after.X()
-                dy = before.Y() - after.Y()
-                dz = before.Z() - after.Z()
-                view.Pan(dx, dy, dz)
-            except Exception:
-                pass
-            try:
-                view.Redraw()
-            except Exception:
-                try:
-                    self.viewer._display.Repaint()
-                except Exception:
-                    pass
-            return True
+                    view.Zoom(x + zoom_step, y + zoom_step, x - zoom_step, y - zoom_step)
+            else:
+                return False
         except Exception:
             return False
+
+        p_after = _get_ray_plane_point(x, y)
+        if p_before is not None and p_after is not None:
+            try:
+                drift_mm = gp_Vec(p_after, p_before).Magnitude()
+            except Exception:
+                drift_mm = -1.0
+            try:
+                try:
+                    sp_before = view.Project(p_before.X(), p_before.Y(), p_before.Z())
+                    sp_after = view.Project(p_after.X(), p_after.Y(), p_after.Z())
+                    sx1, sy1 = float(sp_before.X()), float(sp_before.Y())
+                    sx2, sy2 = float(sp_after.X()), float(sp_after.Y())
+                except Exception:
+                    try:
+                        sx1, sy1, _ = view.Project(p_before.X(), p_before.Y(), p_before.Z())
+                        sx2, sy2, _ = view.Project(p_after.X(), p_after.Y(), p_after.Z())
+                    except Exception:
+                        sx1, sy1 = 0.0, 0.0
+                        sx2, sy2 = 0.0, 0.0
+
+                dx = sx2 - sx1
+                dy = sy2 - sy1
+                try:
+                    view.Pan(int(dx), int(dy))
+                except Exception:
+                    try:
+                        view.Pan(int(-dx), int(-dy))
+                    except Exception:
+                        pass
+                print(f"[ZOOM] delta={delta} occ=({x},{y}) drift_mm={drift_mm:.6f} pan_px=({dx:.1f},{dy:.1f})")
+            except Exception:
+                print(f"[ZOOM] delta={delta} occ=({x},{y}) drift_mm={drift_mm:.6f} pan_px=(err)")
+        else:
+            print(f"[ZOOM] delta={delta} occ=({x},{y}) drift_mm=-1.0 (anchor_calc_failed)")
+
+        try:
+            view.Redraw()
+        except Exception:
+            try:
+                self.viewer._display.Repaint()
+            except Exception:
+                pass
+        return True
 
     # ---------------- ESC: clear all selections ----------------
     def clear_all_selections(self):
@@ -1340,19 +1516,159 @@ class MainWindow(QMainWindow):
 
     # ---------------- EventFilter ----------------
     def eventFilter(self, obj, event):
-        if obj is self.viewer:
+        vp = None
+        try:
+            vp = self.viewer.viewport() if hasattr(self.viewer, "viewport") else None
+        except Exception:
+            vp = None
+        inner = getattr(self.viewer, "_qt_widget", None)
+        if obj is self.viewer or obj is vp or obj is inner:
+            # ---------------- PTS: left-click MUST NOT rotate ----------------
+            # When point-select mode is ON, consume left press so qtViewer3d does not start rotation.
+            try:
+                if getattr(self, "_toolpath_point_select_mode", False):
+                    if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                        print("[PTS] eventFilter LEFT press received")
+                        occ_xy = self._qt_pos_to_occ_xy(event, obj)
+                        if occ_xy is None:
+                            print("[PTS] click occ=None xy_ok=False")
+                            return True
+                        occ_x, occ_y = occ_xy
+                        print(f"[PTS] click occ=({occ_x},{occ_y}) xy_ok=True")
+                        self._handle_toolpath_point_click(occ_x, occ_y)
+                        return True
+            except Exception:
+                pass
+
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.RightButton:
+                try:
+                    now_ms = int(QTime.currentTime().msecsSinceStartOfDay())
+                except Exception:
+                    now_ms = 0
+                if now_ms and (now_ms - int(getattr(self, "_last_rot_start_ts", 0))) < 80:
+                    return True
+                self._last_rot_start_ts = now_ms
+
+                try:
+                    p = event.position()
+                    px, py = float(p.x()), float(p.y())
+                except Exception:
+                    try:
+                        p = event.pos()
+                        px, py = int(p.x()), int(p.y())
+                    except Exception:
+                        px, py = 0, 0
+                print(f"[ROT] viewer start pos=({px},{py})")
+
+                view = self._get_occ_view()
+                ctx = self._get_ctx()
+                if view is None:
+                    return True
+                xy = self._qt_pos_to_occ_xy(event)
+                if xy is None:
+                    return True
+
+                pivot = None
+                if ctx is not None:
+                    try:
+                        ctx.MoveTo(xy[0], xy[1], view, True)
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(ctx, "DetectedPoint"):
+                            pivot = ctx.DetectedPoint()
+                    except Exception:
+                        pivot = None
+
+                if pivot is None:
+                    pivot = self._ray_plane_point_from_view(view, xy[0], xy[1])
+
+                if pivot is not None:
+                    print(f"[ROT] pivot=({pivot.X():.3f},{pivot.Y():.3f},{pivot.Z():.3f})")
+                    try:
+                        cam = view.Camera()
+                        c0 = cam.Center()
+                        e0 = cam.Eye()
+                        v_ce = gp_Vec(c0, e0)
+                        cam.SetCenter(pivot)
+                        e1 = gp_Pnt(pivot.X(), pivot.Y(), pivot.Z())
+                        e1.Translate(v_ce)
+                        cam.SetEye(e1)
+                        view.SetCamera(cam)
+                        print(f"[ROT] cam_center=({pivot.X():.3f},{pivot.Y():.3f},{pivot.Z():.3f})")
+                    except Exception:
+                        try:
+                            view.SetAt(pivot.X(), pivot.Y(), pivot.Z())
+                            print(f"[ROT] cam_center=({pivot.X():.3f},{pivot.Y():.3f},{pivot.Z():.3f})")
+                        except Exception:
+                            pass
+                    self._show_pivot_marker(pivot)
+                    self._rmb_pivot = pivot
+
+                try:
+                    view.StartRotation(xy[0], xy[1])
+                except Exception:
+                    pass
+
+                self._is_rmb_rotating = True
+                self._rmb_last_xy = (xy[0], xy[1])
+                return True
+
+            if event.type() == QEvent.MouseMove and self._is_rmb_rotating:
+                view = self._get_occ_view()
+                if view is None:
+                    return True
+                xy = self._qt_pos_to_occ_xy(event)
+                if xy is None:
+                    return True
+                try:
+                    view.Rotation(xy[0], xy[1])
+                except Exception:
+                    pass
+                try:
+                    view.Redraw()
+                except Exception:
+                    try:
+                        self.viewer._display.Repaint()
+                    except Exception:
+                        pass
+                self._rmb_last_xy = (xy[0], xy[1])
+                return True
+
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.RightButton:
+                self._is_rmb_rotating = False
+                self._rmb_last_xy = None
+                return True
+
             # Hover: keep detection updated (this is what your working code did)
             if event.type() == QEvent.MouseMove:
                 if self._selection_mode and self._current_shape is not None:
                     self._hover_move_to_debounced(event, 120)
 
             if event.type() == QEvent.Wheel:
-                if self._zoom_at_cursor(event):
+                try:
+                    p = event.position().toPoint()
+                    mx, my = int(p.x()), int(p.y())
+                except Exception:
+                    p = event.pos()
+                    mx, my = int(p.x()), int(p.y())
+                try:
+                    delta = event.angleDelta().y()
+                except Exception:
+                    delta = 0
+                print(f"[ZOOM] wheel delta={delta} pos=({mx},{my})")
+                if self._zoom_to_cursor(event):
                     return True
 
             # Click release: defer capture by 0ms so OCC finishes its internal update
             if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                if self._toolpath_point_select_mode:
+                    return True
                 QTimer.singleShot(0, self._capture_detected_object_after_click)
+
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                if self._toolpath_point_select_mode:
+                    return True
 
                 if self._selection_mode and self._current_shape is not None:
                     mods = QApplication.keyboardModifiers()
@@ -1362,8 +1678,191 @@ class MainWindow(QMainWindow):
         # ✅ DO NOT swallow event
         return super().eventFilter(obj, event)
 
+    def _set_rotation_pivot(self, event):
+        try:
+            p = event.position()
+            px, py = float(p.x()), float(p.y())
+        except Exception:
+            try:
+                p = event.pos()
+                px, py = int(p.x()), int(p.y())
+            except Exception:
+                px, py = 0, 0
+        print(f"[ROT] start pos=({px},{py})")
+        print(f"[ROT] widget={self.__class__.__name__}")
+
+        view = self._get_occ_view()
+        ctx = self._get_ctx()
+        if view is None:
+            return
+
+        pnt = None
+        xy = self._qt_pos_to_occ_xy(event)
+        if xy is not None and ctx is not None:
+            try:
+                ctx.MoveTo(xy[0], xy[1], view, True)
+            except Exception:
+                pass
+            try:
+                if hasattr(ctx, "DetectedPoint"):
+                    pnt = ctx.DetectedPoint()
+            except Exception:
+                pnt = None
+
+        if pnt is None and xy is not None:
+            pnt = self._ray_plane_point_from_view(view, xy[0], xy[1])
+
+        if pnt is None:
+            return
+
+        try:
+            view.SetAt(pnt.X(), pnt.Y(), pnt.Z())
+        except Exception:
+            try:
+                cam = view.Camera()
+                cam.SetCenter(pnt)
+                view.SetCamera(cam)
+            except Exception:
+                pass
+
+        self._show_pivot_marker(pnt)
+        try:
+            view.Redraw()
+        except Exception:
+            try:
+                self.viewer._display.Repaint()
+            except Exception:
+                pass
+
+    def _ray_plane_point_from_view(self, view, x: int, y: int):
+        try:
+            eye = view.Eye()
+            at = view.At()
+        except Exception:
+            return None
+        try:
+            n = gp_Vec(eye, at)
+            n.Normalize()
+        except Exception:
+            return None
+
+        conv = None
+        try:
+            conv = view.ConvertWithProj(x, y)
+        except Exception:
+            conv = None
+
+        if conv is not None:
+            try:
+                xw, yw, zw, dx, dy, dz = conv
+            except Exception:
+                try:
+                    xw, yw, zw, dx, dy, dz = conv[0], conv[1], conv[2], conv[3], conv[4], conv[5]
+                except Exception:
+                    return None
+            origin = gp_Pnt(float(xw), float(yw), float(zw))
+            try:
+                dir_vec = gp_Vec(float(dx), float(dy), float(dz))
+                dir_vec.Normalize()
+            except Exception:
+                return None
+        else:
+            try:
+                wp = view.Convert(x, y)
+            except Exception:
+                return None
+            origin = eye
+            try:
+                dir_vec = gp_Vec(origin, wp)
+                dir_vec.Normalize()
+            except Exception:
+                return None
+
+        denom = n.Dot(dir_vec)
+        if abs(denom) < 1e-9:
+            return None
+        try:
+            v = gp_Vec(origin, at)
+            t = v.Dot(n) / denom
+        except Exception:
+            return None
+        try:
+            return gp_Pnt(
+                origin.X() + dir_vec.X() * t,
+                origin.Y() + dir_vec.Y() * t,
+                origin.Z() + dir_vec.Z() * t,
+            )
+        except Exception:
+            return None
+
+    def _show_pivot_marker(self, pnt: gp_Pnt):
+        ctx = self._get_ctx()
+        if ctx is None or pnt is None:
+            return
+
+        if getattr(self, "_pivot_marker_ais", None) is not None:
+            try:
+                ctx.Remove(self._pivot_marker_ais, False)
+            except Exception:
+                pass
+            self._pivot_marker_ais = None
+
+        try:
+            sphere_shape = BRepPrimAPI_MakeSphere(pnt, 2.0).Shape()
+            ais_p = AIS_Shape(sphere_shape)
+        except Exception:
+            return
+
+        try:
+            ais_p.SetColor(Quantity_Color(1.0, 0.0, 1.0, Quantity_TOC_RGB))
+        except Exception:
+            pass
+        try:
+            ctx.SetDisplayMode(ais_p, AIS_Shaded, False)
+        except Exception:
+            pass
+        try:
+            ais_p.SetZLayer(Graphic3d_ZLayerId_Top)
+        except Exception:
+            pass
+
+        ctx.Display(ais_p, False)
+        try:
+            ctx.Deactivate(ais_p)
+        except Exception:
+            try:
+                ctx.SetSelectable(ais_p, False)
+            except Exception:
+                pass
+
+        self._pivot_marker_ais = ais_p
+
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            try:
+                self.viewer._display.Repaint()
+            except Exception:
+                pass
+
+        def _clear_marker():
+            if self._pivot_marker_ais is None:
+                return
+            try:
+                ctx.Remove(self._pivot_marker_ais, False)
+            except Exception:
+                pass
+            self._pivot_marker_ais = None
+            try:
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
+
+        QTimer.singleShot(2000, _clear_marker)
+
     def _hover_move_to_debounced(self, event, debounce_ms: int = 30):
-        self._pending_move_event = event
+        xy = self._qt_pos_to_occ_xy(event)
+        self._pending_move_xy = xy
         if not hasattr(self, "_hover_timer") or self._hover_timer is None:
             self._hover_timer = QTimer(self)
             self._hover_timer.setSingleShot(True)
@@ -1378,10 +1877,7 @@ class MainWindow(QMainWindow):
         view = self._get_occ_view()
         if ctx is None or view is None:
             return
-        event = getattr(self, "_pending_move_event", None)
-        if event is None:
-            return
-        xy = self._qt_to_occ_xy(event)
+        xy = getattr(self, "_pending_move_xy", None)
         if xy is None:
             return
         x, y = xy
@@ -1516,6 +2012,14 @@ class MainWindow(QMainWindow):
         g1_node.setCheckState(0, Qt.Checked if self._toolpath_g1_visible else Qt.Unchecked)
         g1_node.setData(0, ROLE_META, ("TOOLPATH_G1", None))
         g1_node.setData(0, ROLE_AIS, self._toolpath_g1_ais)
+
+        sel_parent = QTreeWidgetItem(toolpath, ["Selected Points"])
+        sel_parent.setFlags(sel_parent.flags() | Qt.ItemIsUserCheckable)
+        sel_parent.setCheckState(0, Qt.Checked)
+        sel_parent.setData(0, ROLE_META, ("TP_SELECTED_POINTS", None))
+        sel_parent.setData(0, ROLE_AIS, None)
+        self._toolpath_points_parent_item = sel_parent
+        self._rebuild_selected_points_tree()
 
     def set_tree_for_step(self, file_path: str, edge_count: int):
         self.tree.blockSignals(True)
@@ -1759,7 +2263,24 @@ class MainWindow(QMainWindow):
         if item is None:
             return
 
-        locked = {"Assembly", "Polylines", "Toolpath", "G0 Rapid", "G1 Feed"}
+        meta = None
+        try:
+            meta = item.data(0, ROLE_META)
+        except Exception:
+            meta = None
+
+        if isinstance(meta, dict) and meta.get("kind") == "TP_POINT":
+            menu = QMenu(self.tree)
+            act_rename = menu.addAction("Rename...")
+            act_offset = menu.addAction("Apply Offset...")
+            action = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if action == act_rename:
+                self._rename_selected_point(item)
+            elif action == act_offset:
+                self._apply_offset_to_selected_point(item)
+            return
+
+        locked = {"Assembly", "Polylines", "Toolpath", "G0 Rapid", "G1 Feed", "Selected Points"}
         if item.text(0) in locked:
             return
 
@@ -1806,6 +2327,778 @@ class MainWindow(QMainWindow):
             item.setText(0, new)
         finally:
             self.tree.blockSignals(False)
+
+    # ---------------- Toolpath point selection ----------------
+    def _toggle_toolpath_point_select_mode(self, checked: bool):
+        self._toolpath_point_select_mode = bool(checked)
+        if self._toolpath_point_select_mode:
+            print("[PTS] mode ON")
+            if not self._toolpath_points and self._nc_points:
+                self._toolpath_points = list(self._nc_points)
+                self._toolpath_points_is_nc = True
+                print(f"[PTS] toolpath_points synced from nc_points len={len(self._toolpath_points)}")
+            elif not self._toolpath_points:
+                print("[PTS] no points available (nc_points empty)")
+            print(f"[PTS] toolpath_points_len={len(self._toolpath_points)} nc_points_len={len(self._nc_points)}")
+            if self._selection_mode:
+                self._selection_mode = False
+                self._selected_edge_ids = []
+                self._clear_selected_overlay()
+            self._ensure_nc_pick_points()
+            self._activate_toolpath_vertex_picking(True)
+            self.statusBar().showMessage("Toolpath point selection enabled. Click points to add P1, P2, ...")
+        else:
+            print("[PTS] mode OFF")
+            self._activate_toolpath_vertex_picking(False)
+            self.statusBar().showMessage("Toolpath point selection disabled.")
+
+    def _activate_toolpath_vertex_picking(self, enabled: bool):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        if enabled:
+            for ais in list(self._nc_pick_points_ais):
+                try:
+                    ctx.Display(ais, False)
+                except Exception:
+                    pass
+                try:
+                    ctx.Activate(ais)  # point selection
+                except Exception:
+                    try:
+                        ctx.Activate(ais, 0, True)
+                    except Exception:
+                        pass
+            try:
+                ctx.UpdateCurrentViewer()
+            except Exception:
+                pass
+        else:
+            for ais in list(getattr(self, "_nc_pick_points_ais", [])):
+                try:
+                    ctx.Deactivate(ais)
+                except Exception:
+                    try:
+                        ctx.Deactivate(ais, 0)
+                    except Exception:
+                        pass
+                try:
+                    ctx.Erase(ais, False)
+                except Exception:
+                    pass
+
+    def _rebuild_selected_points_tree(self):
+        parent = getattr(self, "_toolpath_points_parent_item", None)
+        if parent is None:
+            return
+        parent.takeChildren()
+        for pid, data in self._selected_points.items():
+            item = QTreeWidgetItem(parent, [data.get("name", f"P{pid}")])
+            item.setData(0, ROLE_META, {
+                "kind": "TP_POINT",
+                "id": pid,
+                "index": data.get("index"),
+                "orig": data.get("orig"),
+                "pos": data.get("pos"),
+            })
+            item.setToolTip(0, self._format_point_tooltip(data.get("pos")))
+            data["tree_item"] = item
+
+    def _format_point_tooltip(self, pos):
+        if not pos or len(pos) < 3:
+            return ""
+        return f"XYZ = ({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f})"
+
+    def _rename_selected_point(self, item):
+        meta = item.data(0, ROLE_META)
+        if not isinstance(meta, dict):
+            return
+        pid = meta.get("id")
+        if pid not in self._selected_points:
+            return
+        old = item.text(0)
+        new, ok = QInputDialog.getText(self, "Rename Point", "New name:", text=old)
+        if not ok:
+            return
+        new = (new or "").strip()
+        if not new:
+            return
+        item.setText(0, new)
+        self._selected_points[pid]["name"] = new
+        self._update_selected_point_label(pid)
+
+    def _apply_offset_to_selected_point(self, item):
+        meta = item.data(0, ROLE_META)
+        if not isinstance(meta, dict):
+            return
+        pid = meta.get("id")
+        if pid not in self._selected_points:
+            return
+        sel = self._selected_points[pid]
+        idx = sel.get("index")
+        if idx is None:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Apply Offset")
+        layout = QFormLayout(dialog)
+
+        spin_dx = QDoubleSpinBox()
+        spin_dx.setRange(-100000.0, 100000.0)
+        spin_dx.setDecimals(4)
+        spin_dx.setValue(0.0)
+        layout.addRow("Offset X:", spin_dx)
+
+        spin_dy = QDoubleSpinBox()
+        spin_dy.setRange(-100000.0, 100000.0)
+        spin_dy.setDecimals(4)
+        spin_dy.setValue(0.0)
+        layout.addRow("Offset Y:", spin_dy)
+
+        spin_dz = QDoubleSpinBox()
+        spin_dz.setRange(-100000.0, 100000.0)
+        spin_dz.setDecimals(4)
+        spin_dz.setValue(0.0)
+        layout.addRow("Offset Z:", spin_dz)
+
+        spin_before = QSpinBox()
+        spin_before.setRange(0, 1000000)
+        spin_before.setValue(0)
+        layout.addRow("Points BEFORE:", spin_before)
+
+        spin_after = QSpinBox()
+        spin_after.setRange(0, 1000000)
+        spin_after.setValue(0)
+        layout.addRow("Points AFTER:", spin_after)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        dx = float(spin_dx.value())
+        dy = float(spin_dy.value())
+        dz = float(spin_dz.value())
+        if dx == 0.0 and dy == 0.0 and dz == 0.0:
+            return
+        n_before = int(spin_before.value())
+        n_after = int(spin_after.value())
+        self._apply_offset_with_ramp(idx, n_before, n_after, dx, dy, dz)
+
+    def _compute_ramp_weights(self, sel_idx: int, n_before: int, n_after: int, total: int):
+        weights = {}
+        if total <= 0:
+            return weights
+        sel_idx = max(0, min(int(sel_idx), total - 1))
+        start = max(0, sel_idx - max(0, int(n_before)))
+        end = min(total - 1, sel_idx + max(0, int(n_after)))
+        if sel_idx >= start:
+            denom = max(1, sel_idx - start)
+            for i in range(start, sel_idx + 1):
+                w = 1.0 if denom == 0 else float(i - start) / float(denom)
+                weights[i] = max(weights.get(i, 0.0), w)
+        if end >= sel_idx:
+            denom = max(1, end - sel_idx)
+            for i in range(sel_idx, end + 1):
+                w = 1.0 if denom == 0 else float(end - i) / float(denom)
+                weights[i] = max(weights.get(i, 0.0), w)
+        return weights
+
+    def _apply_offset_with_ramp(self, sel_idx: int, n_before: int, n_after: int, dx: float, dy: float, dz: float):
+        if not self._toolpath_points:
+            return
+        weights = self._compute_ramp_weights(sel_idx, n_before, n_after, len(self._toolpath_points))
+        if not weights:
+            return
+        for i, w in weights.items():
+            x, y, z = self._toolpath_points[i]
+            self._toolpath_points[i] = (x + dx * w, y + dy * w, z + dz * w)
+
+        if self._toolpath_points_is_nc:
+            self._sync_nc_points_from_toolpath()
+            self._rebuild_nc_segments_from_points()
+            self.load_toolpath_segments(
+                [(p1, p2) for p1, p2, _ in self._nc_segments_g0],
+                [(p1, p2) for p1, p2, _ in self._nc_segments_g1],
+                fitall=False,
+                keep_tool=True,
+            )
+        else:
+            segments = []
+            prev = None
+            for p in self._toolpath_points:
+                if prev is not None:
+                    segments.append((prev, p))
+                prev = p
+            self.load_toolpath_segments([], segments, fitall=False, keep_tool=True)
+
+        self._refresh_selected_points_after_offset()
+
+    def _sync_nc_points_from_toolpath(self):
+        if not self._toolpath_points:
+            return
+        if len(self._nc_points) != len(self._toolpath_points):
+            self._nc_points = list(self._toolpath_points)
+        else:
+            for i, p in enumerate(self._toolpath_points):
+                self._nc_points[i] = p
+        for li, pi in enumerate(self._nc_line_to_point):
+            if pi is not None and pi >= 0 and pi < len(self._nc_points):
+                try:
+                    self._nc_line_state[li]["pos"] = self._nc_points[pi]
+                except Exception:
+                    pass
+
+    def _rebuild_nc_segments_from_points(self):
+        if not self._nc_points:
+            return
+        new_g0 = []
+        for _, _, li in self._nc_segments_g0:
+            if li < 0 or li >= len(self._nc_line_to_point):
+                continue
+            pi = self._nc_line_to_point[li]
+            if pi is None or pi <= 0 or pi >= len(self._nc_points):
+                continue
+            p2 = self._nc_points[pi]
+            p1 = self._nc_points[pi - 1]
+            new_g0.append((p1, p2, li))
+        new_g1 = []
+        for _, _, li in self._nc_segments_g1:
+            if li < 0 or li >= len(self._nc_line_to_point):
+                continue
+            pi = self._nc_line_to_point[li]
+            if pi is None or pi <= 0 or pi >= len(self._nc_points):
+                continue
+            p2 = self._nc_points[pi]
+            p1 = self._nc_points[pi - 1]
+            new_g1.append((p1, p2, li))
+        self._nc_segments_g0 = new_g0
+        self._nc_segments_g1 = new_g1
+
+    def _refresh_selected_points_after_offset(self):
+        for pid, data in self._selected_points.items():
+            idx = data.get("index")
+            if idx is None or idx < 0 or idx >= len(self._toolpath_points):
+                continue
+            data["pos"] = self._toolpath_points[idx]
+            item = data.get("tree_item")
+            if item is not None:
+                item.setToolTip(0, self._format_point_tooltip(data["pos"]))
+            self._update_selected_point_visuals(pid)
+
+    def _update_selected_point_visuals(self, pid: int):
+        data = self._selected_points.get(pid)
+        if not data:
+            return
+        pos = data.get("pos")
+        if not pos or len(pos) < 3:
+            return
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        for key in ("ais_marker", "ais_label"):
+            ais = data.get(key)
+            if ais is not None:
+                try:
+                    ctx.Remove(ais, False)
+                except Exception:
+                    pass
+                data[key] = None
+        self._create_selected_point_visuals(pid, pos, data.get("name", f"P{pid}"))
+        try:
+            ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
+    def _create_selected_point_visuals(self, pid: int, pos, name: str):
+        ctx = self._get_ctx()
+        if ctx is None:
+            return
+        p = gp_Pnt(float(pos[0]), float(pos[1]), float(pos[2]))
+        try:
+            sphere = BRepPrimAPI_MakeSphere(p, 1.5).Shape()
+            ais_marker = AIS_Shape(sphere)
+        except Exception:
+            return
+        try:
+            ais_marker.SetColor(Quantity_Color(0.2, 0.9, 1.0, Quantity_TOC_RGB))
+        except Exception:
+            pass
+        ctx.Display(ais_marker, False)
+        try:
+            ctx.Deactivate(ais_marker)
+        except Exception:
+            try:
+                ctx.SetSelectable(ais_marker, False)
+            except Exception:
+                pass
+
+        ais_label = None
+        try:
+            ais_label = AIS_TextLabel()
+            try:
+                ais_label.SetPosition(p)
+            except Exception:
+                pass
+            try:
+                ais_label.SetText(name)
+            except Exception:
+                pass
+            try:
+                ais_label.SetColor(Quantity_Color(1.0, 1.0, 1.0, Quantity_TOC_RGB))
+            except Exception:
+                pass
+            ctx.Display(ais_label, False)
+            try:
+                ctx.Deactivate(ais_label)
+            except Exception:
+                try:
+                    ctx.SetSelectable(ais_label, False)
+                except Exception:
+                    pass
+        except Exception:
+            ais_label = None
+
+        self._selected_points[pid]["ais_marker"] = ais_marker
+        self._selected_points[pid]["ais_label"] = ais_label
+
+    def _update_selected_point_label(self, pid: int):
+        data = self._selected_points.get(pid)
+        if not data:
+            return
+        label = data.get("ais_label")
+        if label is None:
+            return
+        try:
+            label.SetText(data.get("name", f"P{pid}"))
+        except Exception:
+            pass
+        try:
+            ctx = self._get_ctx()
+            if ctx is not None:
+                ctx.Redisplay(label, False)
+                ctx.UpdateCurrentViewer()
+        except Exception:
+            pass
+
+    def _select_toolpath_point_from_event(self, event) -> bool:
+        xy = self._qt_pos_to_occ_xy(event)
+        if xy is None:
+            return False
+        return self._select_toolpath_point_from_xy(xy[0], xy[1])
+
+    def _select_toolpath_point_from_xy(self, occ_x: int, occ_y: int) -> bool:
+        if not self._toolpath_points:
+            if self._debug_pick:
+                print("[PTS] no toolpath points")
+            return False
+        view = self._get_occ_view()
+        if view is None:
+            return False
+        if self._debug_pick:
+            print(f"[PTS] click x={occ_x} y={occ_y} mode={self._toolpath_point_select_mode}")
+        idx = self._pick_toolpath_point_index(view, occ_x, occ_y)
+        if idx is None:
+            return False
+        print(f"[PTS] pick idx={idx} (before add)")
+        try:
+            if not self._add_selected_toolpath_point(idx):
+                print("[PTS] add failed: add_selected_toolpath_point returned False")
+                return False
+        except Exception as e:
+            print(f"[PTS] add failed: {e}")
+            return False
+        return True
+
+    def _add_selected_toolpath_point(self, idx: int) -> bool:
+        if idx is None or idx < 0 or idx >= len(self._toolpath_points):
+            return False
+        pos = self._toolpath_points[idx]
+        self._selected_points_counter += 1
+        pid = self._selected_points_counter
+        name = f"P{pid}"
+        self._selected_points[pid] = {
+            "id": pid,
+            "name": name,
+            "index": idx,
+            "orig": pos,
+            "pos": pos,
+            "ais_marker": None,
+            "ais_label": None,
+            "tree_item": None,
+        }
+        self._create_selected_point_visuals(pid, pos, name)
+        self._rebuild_selected_points_tree()
+        print(f"[PTS] selected idx={idx} xyz=({pos[0]:.4f},{pos[1]:.4f},{pos[2]:.4f}) Pname={name}")
+        return True
+
+    def _pick_toolpath_point_index(self, view, occ_x: int, occ_y: int):
+        if not self._toolpath_points:
+            return None
+        ctx = self._get_ctx()
+        if ctx is not None and self._nc_pick_points_ais:
+            try:
+                ctx.MoveTo(occ_x, occ_y, view, True)
+            except Exception:
+                pass
+            try:
+                has_det = False
+                try:
+                    has_det = bool(ctx.HasDetected())
+                except Exception:
+                    has_det = False
+                nb_det = None
+                try:
+                    nb_det = ctx.NbDetected()
+                except Exception:
+                    nb_det = None
+                print(f"[PTS] detect HasDetected={has_det} NbDetected={nb_det}")
+
+                if not has_det:
+                    return None
+
+                det = None
+                try:
+                    det = ctx.DetectedInteractive()
+                except Exception:
+                    det = None
+                if det is None:
+                    print("[PTS] detected but DetectedInteractive=None")
+                    return None
+
+                # --- NEW: if we detected an AIS_Point, read its 3D position and match nearest toolpath point
+                tname = None
+                try:
+                    tname = det.DynamicType().Name()
+                except Exception:
+                    tname = None
+
+                if tname == "AIS_Point":
+                    p = None
+                    # Try multiple APIs because pythonocc versions differ
+                    try:
+                        comp = det.Component()
+                        if comp is not None:
+                            p = comp.Pnt()
+                    except Exception:
+                        pass
+                    if p is None:
+                        try:
+                            comp = det.GetComponent()
+                            if comp is not None:
+                                p = comp.Pnt()
+                        except Exception:
+                            pass
+                    if p is None:
+                        try:
+                            # some builds expose a Geom_Point directly
+                            gpnt = det.Pnt()
+                            if gpnt is not None:
+                                p = gpnt
+                        except Exception:
+                            pass
+
+                    if p is None:
+                        print("[PTS] AIS_Point detected but could not read 3D point from it")
+                        return None
+
+                    idx = self._nearest_toolpath_index_3d(p)
+                    if idx is not None:
+                        print(f"[PTS] pick idx={idx} method=AIS_POINT_3D xyz=({p.X():.3f},{p.Y():.3f},{p.Z():.3f})")
+                        return idx
+                    print("[PTS] AIS_Point 3D read ok but nearest idx not found")
+                    return None
+
+                print(f"[PTS] selected but not matched type={tname}")
+                return None
+
+            except Exception:
+                return None
+
+        return None
+
+    def _handle_toolpath_point_click(self, occ_x: int, occ_y: int) -> None:
+        """
+        PTS click handler:
+        - move-to / detect at cursor
+        - if detected AIS_Point => read its 3D position (robustly)
+        - map to nearest toolpath point index
+        - add as P1/P2/... using existing pipeline
+        """
+        view = self._get_occ_view()
+        ctx = self._get_ctx()
+        # NOTE: In some pythonocc builds, AIS_Point doesn't expose Component/Pnt reliably. Use ctx.DetectedPoint().
+        if view is None or ctx is None:
+            print("[PTS] no view/ctx")
+            return
+        if not getattr(self, "_toolpath_points", None):
+            print("[PTS] no toolpath points")
+            return
+
+        # ------------------------------------------------------------------
+        # Robust pick: project toolpath 3D points to screen and find nearest.
+        # This avoids relying solely on AIS_Point detection.
+        # ------------------------------------------------------------------
+        idx = self._nearest_toolpath_index_screen(occ_x, occ_y, max_px=14)
+        if idx is not None:
+            try:
+                p = self._toolpath_points[idx]
+                msg = f"PTS pick idx={idx} xyz=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})"
+                print(f"[PTS] {msg}")
+                if hasattr(self, "statusBar") and self.statusBar():
+                    self.statusBar().showMessage(msg, 4000)
+            except Exception:
+                pass
+            try:
+                if not self._add_selected_toolpath_point(idx):
+                    print("[PTS] add failed: _add_selected_toolpath_point returned False")
+                return
+            except Exception as e:
+                print(f"[PTS] add failed exception: {e}")
+                return
+        try:
+            ctx.MoveTo(occ_x, occ_y, view, True)
+        except Exception as e:
+            print(f"[PTS] ctx.MoveTo failed: {e}")
+            return
+
+        has_det = False
+        nb_det = None
+        try:
+            has_det = bool(ctx.HasDetected())
+        except Exception:
+            has_det = False
+        try:
+            nb_det = int(ctx.NbDetected())
+        except Exception:
+            nb_det = None
+        print(f"[PTS] detect HasDetected={has_det} NbDetected={nb_det}")
+
+        if not has_det:
+            print("[PTS] selected none | HasDetected=False")
+            return
+
+        det = None
+        try:
+            det = ctx.DetectedInteractive()
+        except Exception:
+            det = None
+        if det is None:
+            print("[PTS] detected none (DetectedInteractive=None)")
+            return
+
+        tname = None
+        try:
+            if hasattr(det, "DynamicType"):
+                tname = det.DynamicType().Name()
+        except Exception:
+            tname = None
+
+        if tname is None:
+            print("[PTS] detected but type unknown")
+        else:
+            if "AIS_Point" not in str(tname):
+                print(f"[PTS] selected but not matched type={tname}")
+                return
+
+        # ---- Primary: ask the context for the detected 3D point ----
+        xyz = None
+        try:
+            if hasattr(ctx, "DetectedPoint"):
+                p = ctx.DetectedPoint()  # gp_Pnt
+                if p is not None and hasattr(p, "X") and hasattr(p, "Y") and hasattr(p, "Z"):
+                    xyz = (float(p.X()), float(p.Y()), float(p.Z()))
+        except Exception as e:
+            print(f"[PTS] ctx.DetectedPoint failed: {e}")
+
+        # ---- Fallback: try read from AIS_Point (older/newer bindings) ----
+        if xyz is None:
+            xyz = self._try_read_ais_point_xyz(det)
+        if xyz is None:
+            print("[PTS] AIS_Point detected but could not read 3D point from it")
+            return
+
+        # Show coordinates (terminal + statusbar)
+        try:
+            msg = f"PTS xyz=({xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f})"
+            print(f"[PTS] {msg}")
+            if hasattr(self, "statusBar") and self.statusBar():
+                self.statusBar().showMessage(msg, 4000)
+        except Exception:
+            pass
+
+        idx = self._nearest_toolpath_index(xyz)
+        if idx is None:
+            print(f"[PTS] AIS_Point xyz={xyz} but nearest idx not found (tolerance)")
+            return
+
+        print(f"[PTS] pick idx={idx} xyz=({xyz[0]:.6f},{xyz[1]:.6f},{xyz[2]:.6f})")
+        ok = False
+        try:
+            ok = bool(self._add_selected_toolpath_point(idx))
+        except Exception as e:
+            print(f"[PTS] add failed exception: {e}")
+            ok = False
+        if not ok:
+            print("[PTS] add failed: _add_selected_toolpath_point returned False")
+
+    def _nearest_toolpath_index_screen(self, occ_x: int, occ_y: int, max_px: int = 14):
+        """
+        Find nearest toolpath point by comparing click pixel (occ_x,occ_y) to
+        projected pixel of each 3D toolpath point.
+        Returns index or None.
+        """
+        view = self._get_occ_view()
+        if view is None:
+            return None
+        pts = getattr(self, "_toolpath_points", None)
+        if not pts:
+            return None
+
+        best_i = None
+        best_d2 = None
+        for i, p in enumerate(pts):
+            proj = self._project_world_to_screen(view, float(p[0]), float(p[1]), float(p[2]))
+            if proj is None:
+                continue
+            sx, sy = proj
+            dx = float(sx) - float(occ_x)
+            dy = float(sy) - float(occ_y)
+            d2 = dx * dx + dy * dy
+            if best_d2 is None or d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+
+        if best_i is None or best_d2 is None:
+            print("[PTS] screen-pick: no project method worked")
+            return None
+        if best_d2 <= (max_px * max_px):
+            return best_i
+        return None
+
+    def _project_world_to_screen(self, view, x: float, y: float, z: float):
+        """
+        Try multiple OCC bindings for world->screen projection.
+        Returns (sx,sy) in OCC pixel coords, or None.
+        """
+        try:
+            if hasattr(view, "Project"):
+                r = view.Project(x, y, z)
+                if isinstance(r, (tuple, list)) and len(r) >= 2:
+                    return (int(r[0]), int(r[1]))
+                try:
+                    return (int(r.X()), int(r.Y()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            if hasattr(view, "Convert"):
+                r = view.Convert(x, y, z)
+                if isinstance(r, (tuple, list)) and len(r) >= 2:
+                    return (int(r[0]), int(r[1]))
+                try:
+                    return (int(r.X()), int(r.Y()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return None
+
+    def _try_read_ais_point_xyz(self, ais_obj):
+        """
+        Read 3D xyz from an AIS_Point-like object.
+        We try multiple pythonocc bindings because proxies differ by version.
+        Returns (x,y,z) or None.
+        """
+        # Extra: some bindings expose a "Vertex" or "Shape" for the point marker (rare)
+        try:
+            for attr in ("Vertex", "Shape"):
+                if hasattr(ais_obj, attr):
+                    v = getattr(ais_obj, attr)
+                    v = v() if callable(v) else v
+                    # If this ever returns a TopoDS_Vertex, you could extract gp_Pnt,
+                    # but keep it simple for now.
+        except Exception:
+            pass
+
+        try:
+            if hasattr(ais_obj, "Component"):
+                gp = ais_obj.Component()
+                if gp is not None:
+                    if hasattr(gp, "Pnt"):
+                        p = gp.Pnt()
+                        return (float(p.X()), float(p.Y()), float(p.Z()))
+                    if hasattr(gp, "X") and hasattr(gp, "Y") and hasattr(gp, "Z"):
+                        return (float(gp.X()), float(gp.Y()), float(gp.Z()))
+        except Exception:
+            pass
+
+        for attr in ("Point", "GetPoint", "Pnt"):
+            try:
+                if hasattr(ais_obj, attr):
+                    fn = getattr(ais_obj, attr)
+                    p = fn() if callable(fn) else fn
+                    if p is None:
+                        continue
+                    if hasattr(p, "Pnt"):
+                        pp = p.Pnt()
+                        return (float(pp.X()), float(pp.Y()), float(pp.Z()))
+                    if hasattr(p, "X") and hasattr(p, "Y") and hasattr(p, "Z"):
+                        return (float(p.X()), float(p.Y()), float(p.Z()))
+            except Exception:
+                pass
+
+        return None
+
+    def _nearest_toolpath_index(self, xyz, tol=1e-2):
+        """
+        Map xyz to nearest toolpath point index with tolerance (mm-level default).
+        """
+        if xyz is None:
+            return None
+        x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+        pts = getattr(self, "_toolpath_points", None) or []
+        if not pts:
+            return None
+        best_i = None
+        best_d2 = None
+        for i, p in enumerate(pts):
+            try:
+                dx = float(p[0]) - x
+                dy = float(p[1]) - y
+                dz = float(p[2]) - z
+            except Exception:
+                continue
+            d2 = dx * dx + dy * dy + dz * dz
+            if best_d2 is None or d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+        if best_i is None:
+            return None
+        if best_d2 is not None and best_d2 <= (tol * tol):
+            return best_i
+        return None
+
+    def _nearest_toolpath_index_3d(self, p: gp_Pnt):
+        if not self._toolpath_points or p is None:
+            return None
+        best_idx = None
+        best_d2 = None
+        for i, tp in enumerate(self._toolpath_points):
+            dx = float(tp[0]) - p.X()
+            dy = float(tp[1]) - p.Y()
+            dz = float(tp[2]) - p.Z()
+            d2 = dx * dx + dy * dy + dz * dz
+            if best_d2 is None or d2 < best_d2:
+                best_d2 = d2
+                best_idx = i
+        return best_idx
 
     def _make_unique_sibling_name(self, item, base_name: str) -> str:
         parent = item.parent()
@@ -2029,7 +3322,7 @@ class MainWindow(QMainWindow):
         else:
             if hasattr(self, "_hover_timer") and self._hover_timer is not None:
                 self._hover_timer.stop()
-            self._pending_move_event = None
+            self._pending_move_xy = None
             self._selected_edge_ids = []
             self._clear_selected_overlay()
             self.statusBar().showMessage("Selection mode off.")
@@ -2728,6 +4021,10 @@ class MainWindow(QMainWindow):
         self._nc_segments_g1 = segments_g1
         self._nc_line_state = line_state
         self._nc_current_line = 0
+        self._toolpath_points = list(self._nc_points)
+        self._toolpath_points_is_nc = True
+        self._clear_selected_points()
+        self._ensure_nc_pick_points()
 
         self._nc_view.setPlainText("\n".join(self._nc_lines))
         self._nc_line_slider.setRange(0, max(0, len(self._nc_lines) - 1))
@@ -2966,6 +4263,9 @@ class MainWindow(QMainWindow):
         self._toolpath_g0_ais = self._build_toolpath_ais(g0_segments, g0_color, 1.2)
         self._toolpath_g1_ais = self._build_toolpath_ais(g1_segments, g1_color, 2.5)
         self._apply_toolpath_visibility(update_viewer=not keep_tool)
+        if self._toolpath_point_select_mode:
+            self._ensure_nc_pick_points()
+            self._activate_toolpath_vertex_picking(True)
 
         if fitall:
             try:
@@ -2995,6 +4295,13 @@ class MainWindow(QMainWindow):
                 if not seg or len(seg) < 2:
                     continue
                 segments.append((seg[0], seg[1]))
+            if segments:
+                pts = [segments[0][0]]
+                for a, b in segments:
+                    pts.append(b)
+                self._toolpath_points = pts
+            else:
+                self._toolpath_points = []
         else:
             prev = None
             for p in points:
@@ -3003,6 +4310,9 @@ class MainWindow(QMainWindow):
                 if prev is not None:
                     segments.append((prev, p))
                 prev = p
+            self._toolpath_points = [tuple(p) for p in points if p is not None and len(p) >= 3]
+        self._toolpath_points_is_nc = False
+        self._clear_selected_points()
 
         self.load_toolpath_segments([], segments, fitall=fitall)
 
@@ -3066,6 +4376,9 @@ class MainWindow(QMainWindow):
         if not keep_tool:
             self._clear_tool_vectors()
             self._clear_tool_body()
+            self._clear_selected_points()
+            self._toolpath_points = []
+            self._toolpath_points_is_nc = False
         if update_viewer:
             try:
                 ctx.UpdateCurrentViewer()
@@ -3163,6 +4476,51 @@ class MainWindow(QMainWindow):
                 pass
         self._tool_vec_current_ais = None
         self._tool_vec_samples_ais = None
+
+    def _clear_selected_points(self):
+        ctx = self._get_ctx()
+        if ctx is not None:
+            for _, data in list(self._selected_points.items()):
+                for key in ("ais_marker", "ais_label"):
+                    ais = data.get(key)
+                    if ais is not None:
+                        try:
+                            ctx.Remove(ais, False)
+                        except Exception:
+                            pass
+        self._selected_points.clear()
+        self._selected_points_counter = 0
+        self._rebuild_selected_points_tree()
+
+    def _ensure_nc_pick_points(self):
+        if not self._toolpath_points:
+            return
+        if self._nc_pick_points_ais and len(self._nc_pick_points_ais) == len(self._toolpath_points):
+            return
+        ctx = self._get_ctx()
+        self._nc_pick_points_ais = []
+        for i, p in enumerate(self._toolpath_points):
+            try:
+                geom_p = Geom_CartesianPoint(float(p[0]), float(p[1]), float(p[2]))
+                ais_p = AIS_Point(geom_p)
+            except Exception:
+                continue
+            try:
+                ais_p.SetColor(Quantity_Color(0.2, 0.9, 1.0, Quantity_TOC_RGB))
+            except Exception:
+                pass
+            try:
+                drawer = ais_p.Attributes()
+                if drawer is not None:
+                    drawer.SetPointAspect(Prs3d_PointAspect(Aspect_TOM_PLUS, Quantity_Color(0.2, 0.9, 1.0, Quantity_TOC_RGB), 2.0))
+            except Exception:
+                pass
+            self._nc_pick_points_ais.append(ais_p)
+            if ctx is not None:
+                try:
+                    ctx.Display(ais_p, False)
+                except Exception:
+                    pass
 
     def _clear_tool_body(self):
         ctx = self._get_ctx()
